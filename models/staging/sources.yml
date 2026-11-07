@@ -1,0 +1,16 @@
+version: 2
+
+sources:
+  - name: demo_raw
+    database: DBT_DEMO
+    schema: RAW
+
+    tables:
+      - name: src_customers
+        identifier: SRC_CUSTOMERS
+
+        columns:
+          - name: CUSTOMER_ID
+            data_tests:
+              - not_null
+              - unique

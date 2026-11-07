@@ -1,0 +1,26 @@
+version: 2
+
+models:
+  - name: dim_customer
+    config:
+      materialized: enterprise_load
+      schema: MARTS
+      meta:
+        enterprise_load:
+          load_type: TYPE1
+          natural_keys:
+            - CUSTOMER_ID
+
+          pre_load:
+            column_match: true       # mandatory
+            require_nonempty: true   # optional: may be false for empty source
+            validate_keys: true      # mandatory
+            volume_threshold:
+              enabled: true
+              max_drop_pct: 40
+              max_growth_pct: 100
+
+          post_load:
+            reconcile_counts: true     # optional
+            duplicate_check: true      # mandatory
+            source_target_match: true  # optional

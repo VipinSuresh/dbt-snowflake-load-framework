@@ -1,0 +1,1592 @@
+{# ===== From: macros/type1_load.sql | definition bodies unchanged ===== #}
+
+{# TYPE1 execution path for enterprise_load.
+   Governed target must already exist.
+   No target CREATE OR REPLACE or ALTER.
+#}
+
+{% macro execute_enterprise_type1(
+    cfg, load_cfg, model_id, model_name,
+    target_relation_name, model_sql,
+    pre_hooks_to_run, post_hooks_to_run
+) %}
+
+    {# Start model audit before source preparation. #}
+    {% set etl_nr = get_current_etl_nr() %}
+    {% set model_execution_id = start_model_stats(
+        etl_nr, model_id, target_relation_name, cfg['load_type']
+    ) %}
+
+    {# Validate the governed target. #}
+    {% set target_relation = adapter.get_relation(
+        database=target_relation_name.database,
+        schema=target_relation_name.schema,
+        identifier=target_relation_name.identifier
+    ) %}
+
+    {% if target_relation is none
+        or target_relation.type | lower != 'table' %}
+
+        {% do record_pre_load_check(
+            model_execution_id, etl_nr,
+            'TARGET_EXISTS_AND_IS_TABLE',
+            false, 0, 1,
+            'The governed target must be deployed separately: '
+            ~ target_relation_name
+        ) %}
+
+        {% do mark_pre_load_failed(
+            model_execution_id, ['TARGET_EXISTS_AND_IS_TABLE']
+        ) %}
+
+        {{ exceptions.raise_compiler_error(
+            'ENTERPRISE_LOAD: Target table missing or not '
+            ~ 'a physical table: ' ~ target_relation_name
+        ) }}
+    {% endif %}
+
+    {# Prepare temporary source in writable workspace. #}
+    {% set temp_name = 'EL_SRC_' ~ (model_name | upper)
+        ~ '_' ~ (invocation_id | replace('-', '') | upper) %}
+
+    {% set source_relation = api.Relation.create(
+        database=target.database,
+        schema=target.schema,
+        identifier=temp_name,
+        type='table'
+    ) %}
+
+    {{ run_hooks(pre_hooks_to_run) }}
+
+    {% call statement('prepare_source', auto_begin=False) %}
+        CREATE TEMPORARY TABLE {{ source_relation }} AS
+        {{ model_sql }}
+    {% endcall %}
+
+    {# Execute pre-load validations. #}
+    {% do set_model_stage(
+        model_execution_id, 'PRE_LOAD_RUNNING'
+    ) %}
+
+    {% set pre_results = check_pre_load(
+        source_relation,
+        target_relation,
+        cfg['natural_keys'],
+        cfg['pre_load']['require_nonempty'],
+        model_execution_id,
+        etl_nr
+    ) %}
+
+    {# Preserve existing TYPE1 volume-threshold behavior. #}
+    {% if pre_results['passed'] %}
+
+        {% set pre_load_cfg = load_cfg.get('pre_load', {}) or {} %}
+        {% set volume_cfg = pre_load_cfg.get(
+            'volume_threshold', {}
+        ) %}
+
+        {% set volume_result = check_source_volume_threshold(
+            model_execution_id,
+            etl_nr,
+            model_id,
+            pre_results['source_row_count'],
+            volume_cfg
+        ) %}
+
+        {% if not volume_result['passed'] %}
+
+            {% for check_name in volume_result['failed_checks'] %}
+                {% do pre_results['failed_checks'].append(
+                    check_name
+                ) %}
+            {% endfor %}
+
+            {% do pre_results.update({'passed': false}) %}
+
+        {% endif %}
+    {% endif %}
+
+    {# Reject invalid source before DML. #}
+    {% if not pre_results['passed'] %}
+
+        {% do mark_pre_load_failed(
+            model_execution_id,
+            pre_results['failed_checks'],
+            pre_results['source_row_count']
+        ) %}
+
+        {{ exceptions.raise_compiler_error(
+            'ENTERPRISE_LOAD: Pre-load validation blocked '
+            ~ 'the load. Failed checks: '
+            ~ (pre_results['failed_checks'] | join(', '))
+            ~ '. Target table was not modified.'
+        ) }}
+
+    {% endif %}
+
+    {# Capture target count before execution. #}
+    {% set before_result = run_query(
+        'SELECT COUNT(*) FROM ' ~ target_relation
+    ) %}
+
+    {% set target_before = before_result.rows[0][0] | int %}
+
+    {% do mark_pre_load_passed(
+        model_execution_id,
+        pre_results['source_row_count'],
+        target_before
+    ) %}
+
+    {# Generate and execute existing TYPE1 MERGE. #}
+    {% set merge_sql = generate_type1_merge_sql(
+        source_relation,
+        target_relation,
+        cfg['natural_keys'],
+        etl_nr,
+        'enterprise_dbt_framework'
+    ) %}
+
+    {% do set_model_stage(
+        model_execution_id, 'MERGE_RUNNING'
+    ) %}
+
+    {% set dml_stats = execute_snowflake_merge(
+        merge_sql, 'main'
+    ) %}
+
+    {# Capture statistics after DML. #}
+    {% set after_result = run_query(
+        'SELECT COUNT(*) FROM ' ~ target_relation
+    ) %}
+
+    {% set target_after = after_result.rows[0][0] | int %}
+
+    {% do finish_model_stats(
+        model_execution_id,
+        dml_stats,
+        target_after
+    ) %}
+
+    {# Existing TYPE1 post-load checks. #}
+    {% set dq_result = run_type1_post_load_checks(
+        source_relation,
+        target_relation,
+        cfg['natural_keys'],
+        model_execution_id,
+        etl_nr,
+        target_before,
+        target_after,
+        dml_stats,
+        cfg['post_load']
+    ) %}
+
+    {# Clean up temporary source. #}
+    {% call statement('cleanup_source', auto_begin=False) %}
+        DROP TABLE IF EXISTS {{ source_relation }}
+    {% endcall %}
+
+    {{ run_hooks(post_hooks_to_run) }}
+
+    {% do adapter.commit() %}
+
+    {% if not dq_result['passed'] %}
+
+        {{ exceptions.raise_compiler_error(
+            'ENTERPRISE_LOAD: Post-load DQ failed after '
+            ~ 'data commit. Failed checks: '
+            ~ (dq_result['failed_checks'] | join(', '))
+        ) }}
+
+    {% endif %}
+
+    {% do log(
+        'ENTERPRISE_LOAD SUCCESS | Target=' ~ target_relation
+        ~ ' | ETL_NR=' ~ etl_nr
+        ~ ' | Inserted=' ~ dml_stats['rows_inserted']
+        ~ ' | Updated=' ~ dml_stats['rows_updated'],
+        info=true
+    ) %}
+
+    {% do return(target_relation) %}
+
+{% endmacro %}
+
+
+{# ===== From: macros/type2_load.sql | definition bodies unchanged ===== #}
+{# Snowflake TYPE2 path for enterprise_load. No DDL/ALTER against governed history table. #}
+{% macro execute_enterprise_type2(cfg, model_id, model_name, target_relation_name, model_sql, pre_hooks_to_run, post_hooks_to_run) %}
+  {% set etl_nr = get_current_etl_nr() %}
+  {% set model_execution_id = start_model_stats(etl_nr, model_id, target_relation_name, 'TYPE2') %}
+  {% set history_target = adapter.get_relation(
+      database=target_relation_name.database,
+      schema=target_relation_name.schema,
+      identifier=target_relation_name.identifier
+  ) %}
+  {% if history_target is none or history_target.type | lower != 'table' %}
+    {% do record_pre_load_check(model_execution_id, etl_nr,
+      'TYPE2_TARGET_TABLE', false, 0, 1,
+      'History target must already be a physical table: ' ~ target_relation_name) %}
+    {% do mark_pre_load_failed(model_execution_id, ['TYPE2_TARGET_TABLE']) %}
+    {{ exceptions.raise_compiler_error('TYPE2: Governed history table is missing: ' ~ target_relation_name) }}
+  {% endif %}
+
+  {# Source staging only in DBT_WORK; this is not the governed MARTS schema. #}
+  {% set suffix = invocation_id | replace('-', '') | upper %}
+  {% set prepared_source = api.Relation.create(
+      database=target.database,
+      schema=target.schema,
+      identifier='EL_T2_SRC_' ~ (model_name | upper) ~ '_' ~ suffix,
+      type='table'
+  ) %}
+  {% set delta_relation = api.Relation.create(
+      database=target.database,
+      schema=target.schema,
+      identifier='EL_T2_DELTA_' ~ (model_name | upper) ~ '_' ~ suffix,
+      type='table'
+  ) %}
+  {{ run_hooks(pre_hooks_to_run) }}
+  {% call statement('type2_prepare_source', auto_begin=False) %}
+    CREATE TEMPORARY TABLE {{ prepared_source }} AS
+    {{ model_sql }}
+  {% endcall %}
+
+  {% do set_model_stage(model_execution_id, 'PRE_LOAD_RUNNING') %}
+  {% set pre = check_type2_pre_load(
+      prepared_source, history_target, cfg['natural_keys'],
+      cfg['pre_load']['require_nonempty'], model_execution_id, etl_nr
+  ) %}
+  {% if pre['passed'] %}
+    {% set volume = cfg['pre_load'].get('volume_threshold', {}) %}
+    {% set volume_result = check_source_volume_threshold(
+        model_execution_id, etl_nr, model_id, pre['source_row_count'], volume
+    ) %}
+    {% if not volume_result['passed'] %}
+      {% for failed in volume_result['failed_checks'] %}
+        {% do pre['failed_checks'].append(failed) %}
+      {% endfor %}
+      {% do pre.update({'passed': false}) %}
+    {% endif %}
+  {% endif %}
+  {% if not pre['passed'] %}
+    {% do mark_pre_load_failed(model_execution_id, pre['failed_checks'], pre['source_row_count']) %}
+    {{ exceptions.raise_compiler_error(
+      'TYPE2: Pre-load checks blocked history changes: ' ~ pre['failed_checks'] | join(', ')
+    ) }}
+  {% endif %}
+
+  {% set before_result = run_query('SELECT COUNT(*) FROM ' ~ history_target) %}
+  {% set target_before = before_result.rows[0][0] | int %}
+  {% do mark_pre_load_passed(model_execution_id, pre['source_row_count'], target_before) %}
+
+  {% set src_cols = adapter.get_columns_in_relation(prepared_source) %}
+  {% set business_cols = [] %}
+  {% set nonkey_cols = [] %}
+  {% set keys = [] %}
+  {% set source_current_join = [] %}
+  {% set source_hist_join = [] %}
+  {% set delta_target_join = [] %}
+  {% for key in cfg['natural_keys'] %}
+    {% set q = adapter.quote(key) %}
+    {% do keys.append(q) %}
+    {% do source_current_join.append('s.' ~ q ~ ' = c.' ~ q) %}
+    {% do source_hist_join.append('s.' ~ q ~ ' = h.' ~ q) %}
+    {% do delta_target_join.append('d.' ~ q ~ ' = t.' ~ q) %}
+  {% endfor %}
+  {% for col in src_cols %}
+    {% set q = adapter.quote(col.name) %}
+    {% do business_cols.append(q) %}
+    {% if col.name | upper not in cfg['natural_keys'] %}
+      {% do nonkey_cols.append(q) %}
+    {% endif %}
+  {% endfor %}
+  {% if nonkey_cols | length == 0 %}
+    {{ exceptions.raise_compiler_error('TYPE2: At least one non-key attribute is required.') }}
+  {% endif %}
+  {% set diffs = [] %}
+  {% for col in nonkey_cols %}
+    {% do diffs.append('s.' ~ col ~ ' IS DISTINCT FROM c.' ~ col) %}
+  {% endfor %}
+  {% set hist_by_key = [] %}
+  {% for key in keys %}{% do hist_by_key.append(key) %}{% endfor %}
+
+  {# Snapshot only NEW and CHANGED records. UNCHANGED rows are excluded. #}
+  {% call statement('type2_prepare_delta', auto_begin=False) %}
+    CREATE TEMPORARY TABLE {{ delta_relation }} AS
+    SELECT
+      s.*,
+      IFF(c.{{ keys[0] }} IS NULL, 'NEW', 'CHANGED') AS EL_ACTION,
+      COALESCE(h.MAX_VERSION, 0) + 1 AS EL_VERSION
+    FROM {{ prepared_source }} s
+    LEFT JOIN {{ history_target }} c
+      ON {{ source_current_join | join(' AND ') }} AND c.IS_CURRENT = TRUE
+    LEFT JOIN (
+      SELECT {{ hist_by_key | join(', ') }}, MAX(VERSION_NO) AS MAX_VERSION
+      FROM {{ history_target }}
+      GROUP BY {{ hist_by_key | join(', ') }}
+    ) h ON {{ source_hist_join | join(' AND ') }}
+    WHERE c.{{ keys[0] }} IS NULL OR ({{ diffs | join(' OR ') }})
+  {% endcall %}
+
+  {% set delta_sql %}
+    SELECT COUNT(*), COUNT_IF(EL_ACTION = 'CHANGED')
+    FROM {{ delta_relation }}
+  {% endset %}
+  {% set delta_info = run_query(delta_sql) %}
+  {% set expected_insert = delta_info.rows[0][0] | int %}
+  {% set expected_expire = delta_info.rows[0][1] | default(0, true) | int %}
+
+  {# The first DML expires existing versions; the second creates new versions.
+     Both are atomic in one Snowflake Scripting transaction and include ROLLBACK. #}
+  {% set insert_fields = business_cols + [
+     'VALID_FROM', 'VALID_TO', 'IS_CURRENT', 'VERSION_NO',
+     'CREATED_BY_PROCESS', 'CREATED_AT', 'ETL_CREATED_RUN_NUMBER', 'ETL_CREATED_AT',
+     'UPDATED_BY_PROCESS', 'UPDATED_AT', 'ETL_UPDATED_RUN_NUMBER', 'ETL_UPDATED_AT'
+  ] %}
+  {% set selected_fields = [] %}
+  {% for col in business_cols %}{% do selected_fields.append('d.' ~ col) %}{% endfor %}
+  {% set selected_fields = selected_fields + [
+      ':v_ts', 'NULL', 'TRUE', 'd.EL_VERSION',
+      "'enterprise_dbt_framework'", ':v_ts', (etl_nr | string), ':v_ts',
+      'NULL', 'NULL', 'NULL', 'NULL'
+  ] %}
+  {% do set_model_stage(model_execution_id, 'MERGE_RUNNING') %}
+  {% call statement('main', fetch_result=True, auto_begin=False) %}
+    EXECUTE IMMEDIATE $$
+    DECLARE
+      v_expired NUMBER DEFAULT 0;
+      v_inserted NUMBER DEFAULT 0;
+      v_ts TIMESTAMP_NTZ DEFAULT CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ(9);
+    BEGIN
+      BEGIN TRANSACTION;
+
+      UPDATE {{ history_target }} t
+      SET VALID_TO = :v_ts,
+          IS_CURRENT = FALSE,
+          UPDATED_BY_PROCESS = 'enterprise_dbt_framework',
+          UPDATED_AT = :v_ts,
+          ETL_UPDATED_RUN_NUMBER = {{ etl_nr }},
+          ETL_UPDATED_AT = :v_ts
+      FROM {{ delta_relation }} d
+      WHERE {{ delta_target_join | join(' AND ') }}
+        AND t.IS_CURRENT = TRUE AND d.EL_ACTION = 'CHANGED';
+      v_expired := SQLROWCOUNT;
+
+      INSERT INTO {{ history_target }} ({{ insert_fields | join(', ') }})
+      SELECT {{ selected_fields | join(', ') }}
+      FROM {{ delta_relation }} d;
+      v_inserted := SQLROWCOUNT;
+
+      COMMIT;
+      RETURN TO_VARCHAR(v_expired) || '|' || TO_VARCHAR(v_inserted);
+    EXCEPTION
+      WHEN OTHER THEN
+        ROLLBACK;
+        RAISE;
+    END;
+    $$;
+  {% endcall %}
+
+  {% set script_result = load_result('main') %}
+  {% if script_result is none or script_result.table is none or script_result.table.rows | length == 0 %}
+    {{ exceptions.raise_compiler_error('TYPE2: No DML row counts returned; verify history target and transaction before retry.') }}
+  {% endif %}
+  {% set parts = (script_result.table.rows[0][0] | string).split('|') %}
+  {% if parts | length != 2 %}
+    {{ exceptions.raise_compiler_error('TYPE2: Unexpected transaction result: ' ~ (script_result.table.rows[0][0] | string)) }}
+  {% endif %}
+  {% set dml = {
+      'rows_inserted': parts[1] | int,
+      'rows_updated': parts[0] | int,
+      'rows_deleted': 0
+  } %}
+  {% do log('TYPE2 DML COMMITTED | inserted versions=' ~ dml['rows_inserted']
+     ~ ' | expired versions=' ~ dml['rows_updated'], info=true) %}
+
+  {% set after_result = run_query('SELECT COUNT(*) FROM ' ~ history_target) %}
+  {% set target_after = after_result.rows[0][0] | int %}
+  {% do finish_model_stats(model_execution_id, dml, target_after) %}
+
+  {% set dq = run_type2_post_load_checks(prepared_source, history_target,
+      cfg['natural_keys'], model_execution_id, etl_nr,
+      target_before, target_after, dml, cfg['post_load']) %}
+  {# Cross-check that the transaction affected exactly the prepared delta. #}
+  {% set count_ok = dml['rows_inserted'] == expected_insert and dml['rows_updated'] == expected_expire %}
+  {% set count_status = record_type2_post_check(model_execution_id, etl_nr,
+      'TYPE2_DELTA_DML_COUNTS', 1 if count_ok else 0, 1) %}
+  {% if count_status == 'FAIL' %}
+    {% do finalize_model_dq(model_execution_id, false) %}
+    {% do dq['failed_checks'].append('TYPE2_DELTA_DML_COUNTS') %}
+    {% do dq.update({'passed': false}) %}
+  {% endif %}
+
+  {% call statement('type2_cleanup_delta', auto_begin=False) %}
+    DROP TABLE IF EXISTS {{ delta_relation }}
+  {% endcall %}
+  {% call statement('type2_cleanup_source', auto_begin=False) %}
+    DROP TABLE IF EXISTS {{ prepared_source }}
+  {% endcall %}
+  {{ run_hooks(post_hooks_to_run) }}
+  {% do adapter.commit() %}
+  {% if not dq['passed'] %}
+    {{ exceptions.raise_compiler_error('TYPE2: Post-load DQ failed after commit: '
+       ~ (dq['failed_checks'] | join(', '))) }}
+  {% endif %}
+  {% do log('ENTERPRISE_LOAD TYPE2 SUCCESS | Target=' ~ history_target
+       ~ ' | ETL_NR=' ~ etl_nr ~ ' | versions inserted=' ~ dml['rows_inserted']
+       ~ ' | versions expired=' ~ dml['rows_updated'], info=true) %}
+  {% do return(history_target) %}
+{% endmacro %}
+
+
+{# ===== From: macros/insert_load.sql | definition bodies unchanged ===== #}
+
+{# INSERT-only strategy for existing governed Snowflake targets. #}
+
+{% macro execute_enterprise_insert(
+    cfg, load_cfg, model_id, model_name,
+    target_relation_name, model_sql,
+    pre_hooks_to_run, post_hooks_to_run
+) %}
+
+    {# 1. Start model audit. #}
+
+    {% set etl_nr = get_current_etl_nr() %}
+
+    {% set model_execution_id = start_model_stats(
+        etl_nr, model_id, target_relation_name, 'INSERT'
+    ) %}
+
+    {# 2. Validate governed target existence. #}
+
+    {% set target_relation = adapter.get_relation(
+        database=target_relation_name.database,
+        schema=target_relation_name.schema,
+        identifier=target_relation_name.identifier
+    ) %}
+
+    {% if target_relation is none
+        or target_relation.type | lower != 'table' %}
+
+        {% do record_pre_load_check(
+            model_execution_id, etl_nr,
+            'TARGET_EXISTS_AND_IS_TABLE',
+            false, 0, 1,
+            'Governed target must already exist: '
+            ~ target_relation_name
+        ) %}
+
+        {% do mark_pre_load_failed(
+            model_execution_id,
+            ['TARGET_EXISTS_AND_IS_TABLE']
+        ) %}
+
+        {{ exceptions.raise_compiler_error(
+            'INSERT: Governed target missing or not a table: '
+            ~ target_relation_name
+        ) }}
+
+    {% endif %}
+
+    {# 3. Prepare source snapshot. #}
+
+    {% set temp_name = 'EL_SRC_' ~ (model_name | upper)
+        ~ '_' ~ (invocation_id | replace('-', '') | upper) %}
+
+    {% set source_relation = api.Relation.create(
+        database=target.database,
+        schema=target.schema,
+        identifier=temp_name,
+        type='table'
+    ) %}
+
+    {{ run_hooks(pre_hooks_to_run) }}
+
+    {% call statement('prepare_source', auto_begin=False) %}
+
+        CREATE TEMPORARY TABLE {{ source_relation }} AS
+        {{ model_sql }}
+
+    {% endcall %}
+
+    {# 4. Execute reusable pre-load validations. #}
+
+    {% do set_model_stage(
+        model_execution_id, 'PRE_LOAD_RUNNING'
+    ) %}
+
+    {% set pre_results = check_pre_load(
+        source_relation,
+        target_relation,
+        cfg['natural_keys'],
+        cfg['pre_load']['require_nonempty'],
+        model_execution_id,
+        etl_nr
+    ) %}
+
+    {# 5. Evaluate source-volume thresholds. #}
+
+    {% if pre_results['passed'] %}
+
+        {% set pre_load_cfg =
+            load_cfg.get('pre_load', {}) or {} %}
+
+        {% set volume_cfg =
+            pre_load_cfg.get('volume_threshold', {}) %}
+
+        {% set volume_result = check_source_volume_threshold(
+            model_execution_id,
+            etl_nr,
+            model_id,
+            pre_results['source_row_count'],
+            volume_cfg
+        ) %}
+
+        {% if not volume_result['passed'] %}
+
+            {% for check_name in volume_result['failed_checks'] %}
+                {% do pre_results['failed_checks'].append(
+                    check_name
+                ) %}
+            {% endfor %}
+
+            {% do pre_results.update({'passed': false}) %}
+
+        {% endif %}
+
+    {% endif %}
+
+    {# 6. Stop execution if pre-load fails. #}
+
+    {% if not pre_results['passed'] %}
+
+        {% do mark_pre_load_failed(
+            model_execution_id,
+            pre_results['failed_checks'],
+            pre_results['source_row_count']
+        ) %}
+
+        {{ exceptions.raise_compiler_error(
+            'INSERT: Pre-load validation blocked the load. '
+            ~ 'Failed checks: '
+            ~ (pre_results['failed_checks'] | join(', '))
+            ~ '. Target table was not modified.'
+        ) }}
+
+    {% endif %}
+
+    {# 7. Record target state before DML. #}
+
+    {% set before_result = run_query(
+        'SELECT COUNT(*) FROM ' ~ target_relation
+    ) %}
+
+    {% set target_before =
+        before_result.rows[0][0] | int %}
+
+    {% do mark_pre_load_passed(
+        model_execution_id,
+        pre_results['source_row_count'],
+        target_before
+    ) %}
+
+    {# 8. Generate INSERT-only MERGE. #}
+
+    {% set merge_sql = generate_insert_merge_sql(
+        source_relation,
+        target_relation,
+        cfg['natural_keys'],
+        etl_nr,
+        'enterprise_dbt_framework'
+    ) %}
+
+    {% do set_model_stage(
+        model_execution_id, 'MERGE_RUNNING'
+    ) %}
+
+    {% set dml_stats = execute_snowflake_merge(
+    merge_sql,
+    'main',
+    insert_only=true
+    ) %}
+
+    {# 9. Record post-DML statistics. #}
+
+    {% set after_result = run_query(
+        'SELECT COUNT(*) FROM ' ~ target_relation
+    ) %}
+
+    {% set target_after =
+        after_result.rows[0][0] | int %}
+
+    {% do finish_model_stats(
+        model_execution_id,
+        dml_stats,
+        target_after
+    ) %}
+
+    {# 10. INSERT-specific post-load checks. #}
+
+    {% set dq_result = run_insert_post_load_checks(
+        source_relation,
+        target_relation,
+        cfg['natural_keys'],
+        model_execution_id,
+        etl_nr,
+        target_before,
+        target_after,
+        dml_stats,
+        cfg['post_load']
+    ) %}
+
+    {# 11. Cleanup and finalization. #}
+
+    {% call statement('cleanup_source', auto_begin=False) %}
+
+        DROP TABLE IF EXISTS {{ source_relation }}
+
+    {% endcall %}
+
+    {{ run_hooks(post_hooks_to_run) }}
+
+    {% do adapter.commit() %}
+
+    {% if not dq_result['passed'] %}
+
+        {{ exceptions.raise_compiler_error(
+            'INSERT: Post-load DQ failed after commit. '
+            ~ 'Failed checks: '
+            ~ (dq_result['failed_checks'] | join(', '))
+        ) }}
+
+    {% endif %}
+
+    {% do log(
+        'ENTERPRISE_LOAD INSERT SUCCESS'
+        ~ ' | Target=' ~ target_relation
+        ~ ' | ETL_NR=' ~ etl_nr
+        ~ ' | Inserted=' ~ dml_stats['rows_inserted']
+        ~ ' | Updated=' ~ dml_stats['rows_updated']
+        ~ ' | Deleted=' ~ dml_stats['rows_deleted'],
+        info=true
+    ) %}
+
+    {% do return(target_relation) %}
+
+{% endmacro %}
+
+
+{# ===== From: macros/update_load.sql | definition bodies unchanged ===== #}
+
+{# UPDATE-only strategy for existing governed Snowflake targets. #}
+
+{% macro execute_enterprise_update(
+    cfg, load_cfg, model_id, model_name,
+    target_relation_name, model_sql,
+    pre_hooks_to_run, post_hooks_to_run
+) %}
+
+    {# 1. Start model audit. #}
+
+    {% set etl_nr = get_current_etl_nr() %}
+
+    {% set model_execution_id = start_model_stats(
+        etl_nr, model_id, target_relation_name, 'UPDATE'
+    ) %}
+
+    {# 2. Validate governed target existence. #}
+
+    {% set target_relation = adapter.get_relation(
+        database=target_relation_name.database,
+        schema=target_relation_name.schema,
+        identifier=target_relation_name.identifier
+    ) %}
+
+    {% if target_relation is none
+        or target_relation.type | lower != 'table' %}
+
+        {% do record_pre_load_check(
+            model_execution_id, etl_nr,
+            'TARGET_EXISTS_AND_IS_TABLE',
+            false, 0, 1,
+            'Governed target must already exist: '
+            ~ target_relation_name
+        ) %}
+
+        {% do mark_pre_load_failed(
+            model_execution_id,
+            ['TARGET_EXISTS_AND_IS_TABLE']
+        ) %}
+
+        {{ exceptions.raise_compiler_error(
+            'UPDATE: Governed target missing or not a table: '
+            ~ target_relation_name
+        ) }}
+
+    {% endif %}
+
+    {# 3. Prepare source snapshot. #}
+
+    {% set temp_name = 'EL_SRC_' ~ (model_name | upper)
+        ~ '_' ~ (invocation_id | replace('-', '') | upper) %}
+
+    {% set source_relation = api.Relation.create(
+        database=target.database,
+        schema=target.schema,
+        identifier=temp_name,
+        type='table'
+    ) %}
+
+    {{ run_hooks(pre_hooks_to_run) }}
+
+    {% call statement('prepare_source', auto_begin=False) %}
+
+        CREATE TEMPORARY TABLE {{ source_relation }} AS
+        {{ model_sql }}
+
+    {% endcall %}
+
+    {# 4. Execute reusable pre-load validations. #}
+
+    {% do set_model_stage(
+        model_execution_id, 'PRE_LOAD_RUNNING'
+    ) %}
+
+    {% set pre_results = check_pre_load(
+        source_relation,
+        target_relation,
+        cfg['natural_keys'],
+        cfg['pre_load']['require_nonempty'],
+        model_execution_id,
+        etl_nr
+    ) %}
+
+    {# 5. Evaluate source-volume thresholds. #}
+
+    {% if pre_results['passed'] %}
+
+        {% set pre_load_cfg =
+            load_cfg.get('pre_load', {}) or {} %}
+
+        {% set volume_cfg =
+            pre_load_cfg.get('volume_threshold', {}) %}
+
+        {% set volume_result = check_source_volume_threshold(
+            model_execution_id,
+            etl_nr,
+            model_id,
+            pre_results['source_row_count'],
+            volume_cfg
+        ) %}
+
+        {% if not volume_result['passed'] %}
+
+            {% for check_name in volume_result['failed_checks'] %}
+                {% do pre_results['failed_checks'].append(
+                    check_name
+                ) %}
+            {% endfor %}
+
+            {% do pre_results.update({'passed': false}) %}
+
+        {% endif %}
+
+    {% endif %}
+
+    {# 6. Stop execution if pre-load fails. #}
+
+    {% if not pre_results['passed'] %}
+
+        {% do mark_pre_load_failed(
+            model_execution_id,
+            pre_results['failed_checks'],
+            pre_results['source_row_count']
+        ) %}
+
+        {{ exceptions.raise_compiler_error(
+            'UPDATE: Pre-load validation blocked the load. '
+            ~ 'Failed checks: '
+            ~ (pre_results['failed_checks'] | join(', '))
+            ~ '. Target table was not modified.'
+        ) }}
+
+    {% endif %}
+
+    {# 7. Record target state before DML. #}
+
+    {% set before_result = run_query(
+        'SELECT COUNT(*) FROM ' ~ target_relation
+    ) %}
+
+    {% set target_before =
+        before_result.rows[0][0] | int %}
+
+    {% do mark_pre_load_passed(
+        model_execution_id,
+        pre_results['source_row_count'],
+        target_before
+    ) %}
+
+    {# 8. Generate and execute UPDATE-only MERGE. #}
+
+    {% set merge_sql = generate_update_merge_sql(
+        source_relation,
+        target_relation,
+        cfg['natural_keys'],
+        etl_nr,
+        'enterprise_dbt_framework'
+    ) %}
+
+    {% do set_model_stage(
+        model_execution_id, 'MERGE_RUNNING'
+    ) %}
+
+    {% set dml_stats = execute_snowflake_merge(
+        merge_sql,
+        'main',
+        update_only=true
+    ) %}
+
+    {# 9. Record post-DML statistics. #}
+
+    {% set after_result = run_query(
+        'SELECT COUNT(*) FROM ' ~ target_relation
+    ) %}
+
+    {% set target_after =
+        after_result.rows[0][0] | int %}
+
+    {% do finish_model_stats(
+        model_execution_id,
+        dml_stats,
+        target_after
+    ) %}
+
+    {# 10. UPDATE-specific post-load checks. #}
+
+    {% set dq_result = run_update_post_load_checks(
+        source_relation,
+        target_relation,
+        cfg['natural_keys'],
+        model_execution_id,
+        etl_nr,
+        target_before,
+        target_after,
+        dml_stats,
+        cfg['post_load']
+    ) %}
+
+    {# 11. Cleanup and finalization. #}
+
+    {% call statement('cleanup_source', auto_begin=False) %}
+
+        DROP TABLE IF EXISTS {{ source_relation }}
+
+    {% endcall %}
+
+    {{ run_hooks(post_hooks_to_run) }}
+
+    {% do adapter.commit() %}
+
+    {% if not dq_result['passed'] %}
+
+        {{ exceptions.raise_compiler_error(
+            'UPDATE: Post-load DQ failed after commit. '
+            ~ 'Failed checks: '
+            ~ (dq_result['failed_checks'] | join(', '))
+        ) }}
+
+    {% endif %}
+
+    {% do log(
+        'ENTERPRISE_LOAD UPDATE SUCCESS'
+        ~ ' | Target=' ~ target_relation
+        ~ ' | ETL_NR=' ~ etl_nr
+        ~ ' | Inserted=' ~ dml_stats['rows_inserted']
+        ~ ' | Updated=' ~ dml_stats['rows_updated']
+        ~ ' | Deleted=' ~ dml_stats['rows_deleted'],
+        info=true
+    ) %}
+
+    {% do return(target_relation) %}
+
+{% endmacro %}
+
+
+{# ===== From: macros/truncate_load.sql | definition bodies unchanged ===== #}
+
+{# Transactional full replacement for an existing governed Snowflake table.
+   Configuration name: TRUNCATE_LOAD
+   Physical implementation: DELETE + INSERT in one transaction.
+#}
+
+{% macro execute_enterprise_truncate(
+    cfg, load_cfg, model_id, model_name,
+    target_relation_name, model_sql,
+    pre_hooks_to_run, post_hooks_to_run
+) %}
+
+    {# 1. Initialize execution audit. #}
+
+    {% set etl_nr = get_current_etl_nr() %}
+
+    {% set model_execution_id = start_model_stats(
+        etl_nr, model_id, target_relation_name, 'TRUNCATE_LOAD'
+    ) %}
+
+
+    {# 2. Require an existing governed physical table. #}
+
+    {% set target_relation = adapter.get_relation(
+        database=target_relation_name.database,
+        schema=target_relation_name.schema,
+        identifier=target_relation_name.identifier
+    ) %}
+
+    {% if target_relation is none
+        or target_relation.type | lower != 'table' %}
+
+        {% do record_pre_load_check(
+            model_execution_id, etl_nr,
+            'TARGET_EXISTS_AND_IS_TABLE',
+            false, 0, 1,
+            'Governed target must already exist: ' ~ target_relation_name
+        ) %}
+
+        {% do mark_pre_load_failed(
+            model_execution_id,
+            ['TARGET_EXISTS_AND_IS_TABLE']
+        ) %}
+
+        {{ exceptions.raise_compiler_error(
+            'TRUNCATE_LOAD: Target missing or not a physical table: '
+            ~ target_relation_name
+        ) }}
+
+    {% endif %}
+
+
+    {# 3. Prepare temporary source snapshot. #}
+
+    {% set temp_name = 'EL_SRC_' ~ (model_name | upper)
+        ~ '_' ~ (invocation_id | replace('-', '') | upper) %}
+
+    {% set source_relation = api.Relation.create(
+    database=target_relation.database,
+    schema=target_relation.schema,
+    identifier=temp_name,
+    type='table'
+    ) %}
+
+    {{ run_hooks(pre_hooks_to_run) }}
+
+    {% call statement('prepare_source', auto_begin=False) %}
+        CREATE TEMPORARY TABLE {{ source_relation }} AS
+        {{ model_sql }}
+    {% endcall %}
+
+
+    {# 4. Run shared pre-load checks. #}
+
+    {% do set_model_stage(
+        model_execution_id, 'PRE_LOAD_RUNNING'
+    ) %}
+
+    {% set pre_results = check_pre_load(
+        source_relation,
+        target_relation,
+        cfg['natural_keys'],
+        cfg['pre_load']['require_nonempty'],
+        model_execution_id,
+        etl_nr
+    ) %}
+
+    {% set volume_cfg = cfg['pre_load']['volume_threshold'] %}
+
+
+    {# 5. Compare source volume with previous successful runs. #}
+
+    {% if pre_results['passed'] %}
+
+        {% set volume_result = check_source_volume_threshold(
+            model_execution_id,
+            etl_nr,
+            model_id,
+            pre_results['source_row_count'],
+            volume_cfg
+        ) %}
+
+        {% if not volume_result['passed'] %}
+
+            {% for check_name in volume_result['failed_checks'] %}
+                {% do pre_results['failed_checks'].append(check_name) %}
+            {% endfor %}
+
+            {% do pre_results.update({'passed': false}) %}
+
+        {% endif %}
+
+    {% endif %}
+
+
+    {# 6. Capture current target count and optionally guard major drops. #}
+
+    {% if pre_results['passed'] %}
+
+        {% set before_result = run_query(
+            'SELECT COUNT(*) FROM ' ~ target_relation
+        ) %}
+
+        {% set target_before = before_result.rows[0][0] | int %}
+
+        {% if volume_cfg.get('enabled', false)
+            and target_before > 0 %}
+
+            {% set source_count = pre_results['source_row_count'] | int %}
+            {% set drop_pct = 0 %}
+
+            {% if source_count < target_before %}
+                {% set drop_pct =
+                    (target_before - source_count) * 100.0 / target_before
+                %}
+            {% endif %}
+
+            {% set max_drop_pct = volume_cfg['max_drop_pct'] %}
+            {% set drop_ok = drop_pct <= max_drop_pct %}
+
+            {% do record_pre_load_check(
+                model_execution_id, etl_nr,
+                'REPLACE_TARGET_DROP_PCT',
+                drop_ok,
+                drop_pct,
+                max_drop_pct,
+                'Source row count compared with current target; units=percent'
+            ) %}
+
+            {% if not drop_ok %}
+                {% do pre_results['failed_checks'].append(
+                    'REPLACE_TARGET_DROP_PCT'
+                ) %}
+                {% do pre_results.update({'passed': false}) %}
+            {% endif %}
+
+        {% endif %}
+
+    {% endif %}
+
+
+    {# 7. Reject the replacement if any pre-load check failed. #}
+
+    {% if not pre_results['passed'] %}
+
+        {% do mark_pre_load_failed(
+            model_execution_id,
+            pre_results['failed_checks'],
+            pre_results['source_row_count']
+        ) %}
+
+        {{ exceptions.raise_compiler_error(
+            'TRUNCATE_LOAD: Pre-load validation blocked replacement. '
+            ~ 'Failed checks: '
+            ~ (pre_results['failed_checks'] | join(', '))
+            ~ '. Governed target was not modified.'
+        ) }}
+
+    {% endif %}
+
+    {% do mark_pre_load_passed(
+        model_execution_id,
+        pre_results['source_row_count'],
+        target_before
+    ) %}
+
+
+    {# 8. Generate INSERT SQL from prepared source. #}
+
+    {% set insert_sql = generate_replace_insert_sql(
+        source_relation,
+        target_relation,
+        etl_nr,
+        'enterprise_dbt_framework'
+    ) %}
+
+
+    {# 9. Execute DELETE and INSERT atomically.
+       SQLROWCOUNT must be captured immediately after each DML.
+    #}
+
+    {% do set_model_stage(
+        model_execution_id, 'MERGE_RUNNING'
+    ) %}
+
+    {% call statement('main', fetch_result=True, auto_begin=False) %}
+
+        EXECUTE IMMEDIATE $$
+        DECLARE
+            v_deleted NUMBER DEFAULT 0;
+            v_inserted NUMBER DEFAULT 0;
+        BEGIN
+
+            BEGIN TRANSACTION;
+
+            DELETE FROM {{ target_relation }};
+
+            v_deleted := SQLROWCOUNT;
+
+            {{ insert_sql }};
+
+            v_inserted := SQLROWCOUNT;
+
+            COMMIT;
+
+            RETURN TO_VARCHAR(v_deleted)
+                || '|' || TO_VARCHAR(v_inserted);
+
+        EXCEPTION
+            WHEN OTHER THEN
+                ROLLBACK;
+                RAISE;
+        END;
+        $$;
+
+    {% endcall %}
+
+
+    {# 10. Read actual transaction results. #}
+
+    {% set result = load_result('main') %}
+    {% set result_table = result['table'] %}
+
+    {% if result_table is none
+        or result_table.rows | length == 0 %}
+
+        {{ exceptions.raise_compiler_error(
+            'TRUNCATE_LOAD: Transaction returned no DML counts.'
+        ) }}
+
+    {% endif %}
+
+    {% set returned_value = result_table.rows[0][0] | string %}
+    {% set parts = returned_value.split('|') %}
+
+    {% if parts | length != 2 %}
+
+        {{ exceptions.raise_compiler_error(
+            'TRUNCATE_LOAD: Unexpected transaction result: '
+            ~ returned_value
+        ) }}
+
+    {% endif %}
+
+    {% set dml_stats = {
+        'rows_inserted': parts[1] | int,
+        'rows_updated': 0,
+        'rows_deleted': parts[0] | int
+    } %}
+
+    {% do log(
+        'TRUNCATE_LOAD DML COMMITTED'
+        ~ ' | Deleted=' ~ dml_stats['rows_deleted']
+        ~ ' | Inserted=' ~ dml_stats['rows_inserted'],
+        info=true
+    ) %}
+
+
+    {# 11. Record post-commit statistics. #}
+
+    {% set after_result = run_query(
+        'SELECT COUNT(*) FROM ' ~ target_relation
+    ) %}
+
+    {% set target_after = after_result.rows[0][0] | int %}
+
+    {% do finish_model_stats(
+        model_execution_id,
+        dml_stats,
+        target_after
+    ) %}
+
+
+    {# 12. Run replacement-specific post-load checks. #}
+
+    {% set dq_result = run_truncate_post_load_checks(
+        source_relation,
+        target_relation,
+        cfg['natural_keys'],
+        model_execution_id,
+        etl_nr,
+        pre_results['source_row_count'],
+        target_before,
+        target_after,
+        dml_stats,
+        cfg['post_load']
+    ) %}
+
+
+    {# 13. Cleanup and finalize. #}
+
+    {% call statement('cleanup_source', auto_begin=False) %}
+        DROP TABLE IF EXISTS {{ source_relation }}
+    {% endcall %}
+
+    {{ run_hooks(post_hooks_to_run) }}
+
+    {% do adapter.commit() %}
+
+    {% if not dq_result['passed'] %}
+
+        {{ exceptions.raise_compiler_error(
+            'TRUNCATE_LOAD: Post-load DQ failed after commit. '
+            ~ 'Failed checks: '
+            ~ (dq_result['failed_checks'] | join(', '))
+        ) }}
+
+    {% endif %}
+
+    {% do log(
+        'ENTERPRISE_LOAD TRUNCATE_LOAD SUCCESS'
+        ~ ' | Target=' ~ target_relation
+        ~ ' | ETL_NR=' ~ etl_nr
+        ~ ' | Deleted=' ~ dml_stats['rows_deleted']
+        ~ ' | Inserted=' ~ dml_stats['rows_inserted'],
+        info=true
+    ) %}
+
+    {% do return(target_relation) %}
+
+{% endmacro %}
+
+
+{# ===== From: macros/delete_insert_load.sql | definition bodies unchanged ===== #}
+
+{# Atomic key-scoped DELETE + INSERT for governed Snowflake targets. #}
+
+{% macro execute_enterprise_delete_insert(
+    cfg, load_cfg, model_id, model_name,
+    target_relation_name, model_sql,
+    pre_hooks_to_run, post_hooks_to_run
+) %}
+
+    {# 1. Initialize model audit. #}
+
+    {% set etl_nr = get_current_etl_nr() %}
+
+    {% set model_execution_id = start_model_stats(
+        etl_nr, model_id, target_relation_name, 'DELETE_INSERT'
+    ) %}
+
+
+    {# 2. Resolve existing governed target. #}
+
+    {% set target_relation = adapter.get_relation(
+        database=target_relation_name.database,
+        schema=target_relation_name.schema,
+        identifier=target_relation_name.identifier
+    ) %}
+
+    {% if target_relation is none
+        or target_relation.type | lower != 'table' %}
+
+        {% do record_pre_load_check(
+            model_execution_id, etl_nr,
+            'TARGET_EXISTS_AND_IS_TABLE',
+            false, 0, 1,
+            'Governed target must already exist: '
+            ~ target_relation_name
+        ) %}
+
+        {% do mark_pre_load_failed(
+            model_execution_id,
+            ['TARGET_EXISTS_AND_IS_TABLE']
+        ) %}
+
+        {{ exceptions.raise_compiler_error(
+            'DELETE_INSERT: Target missing or not a physical table: '
+            ~ target_relation_name
+        ) }}
+
+    {% endif %}
+
+
+    {# 3. Prepare temporary source snapshot. #}
+
+    {% set temp_name = 'EL_SRC_' ~ (model_name | upper)
+        ~ '_' ~ (invocation_id | replace('-', '') | upper) %}
+
+    {% set source_relation = api.Relation.create(
+        database=target_relation.database,
+        schema=target_relation.schema,
+        identifier=temp_name,
+        type='table'
+    ) %}
+
+    {{ run_hooks(pre_hooks_to_run) }}
+
+    {% call statement('prepare_source', auto_begin=False) %}
+
+        CREATE TEMPORARY TABLE {{ source_relation }} AS
+        {{ model_sql }}
+
+    {% endcall %}
+
+
+    {# 4. Run shared pre-load validations. #}
+
+    {% do set_model_stage(
+        model_execution_id, 'PRE_LOAD_RUNNING'
+    ) %}
+
+    {% set pre_results = check_pre_load(
+        source_relation,
+        target_relation,
+        cfg['natural_keys'],
+        cfg['pre_load']['require_nonempty'],
+        model_execution_id,
+        etl_nr
+    ) %}
+
+
+    {# 5. Historical source-volume validation. #}
+
+    {% if pre_results['passed'] %}
+
+        {% set volume_result = check_source_volume_threshold(
+            model_execution_id,
+            etl_nr,
+            model_id,
+            pre_results['source_row_count'],
+            cfg['pre_load']['volume_threshold']
+        ) %}
+
+        {% if not volume_result['passed'] %}
+
+            {% for check_name in volume_result['failed_checks'] %}
+
+                {% do pre_results['failed_checks'].append(
+                    check_name
+                ) %}
+
+            {% endfor %}
+
+            {% do pre_results.update({'passed': false}) %}
+
+        {% endif %}
+
+    {% endif %}
+
+
+    {# 6. Reject invalid prepared source before any target DML. #}
+
+    {% if not pre_results['passed'] %}
+
+        {% do mark_pre_load_failed(
+            model_execution_id,
+            pre_results['failed_checks'],
+            pre_results['source_row_count']
+        ) %}
+
+        {{ exceptions.raise_compiler_error(
+            'DELETE_INSERT: Pre-load validation blocked the load. '
+            ~ 'Failed checks: '
+            ~ (pre_results['failed_checks'] | join(', '))
+            ~ '. Governed target was not modified.'
+        ) }}
+
+    {% endif %}
+
+
+    {# 7. Capture target state and expected matching-key count. #}
+
+    {% set before_result = run_query(
+        'SELECT COUNT(*) FROM ' ~ target_relation
+    ) %}
+
+    {% set target_before = before_result.rows[0][0] | int %}
+
+    {% set join_condition = generate_delete_insert_key_match(
+        cfg['natural_keys'],
+        'tgt',
+        'src'
+    ) %}
+
+    {% set overlap_sql %}
+
+        SELECT COUNT(*)
+        FROM {{ target_relation }} AS tgt
+        INNER JOIN {{ source_relation }} AS src
+            ON {{ join_condition }}
+
+    {% endset %}
+
+    {% set overlap_result = run_query(overlap_sql) %}
+
+    {% set expected_deleted =
+        overlap_result.rows[0][0] | int %}
+
+    {% do mark_pre_load_passed(
+        model_execution_id,
+        pre_results['source_row_count'],
+        target_before
+    ) %}
+
+
+    {# 8. Generate key-scoped DELETE and full-row INSERT. #}
+
+    {% set delete_sql = generate_delete_insert_delete_sql(
+        source_relation,
+        target_relation,
+        cfg['natural_keys']
+    ) %}
+
+    {% set insert_sql = generate_replace_insert_sql(
+        source_relation,
+        target_relation,
+        etl_nr,
+        'enterprise_dbt_framework'
+    ) %}
+
+
+    {# 9. Execute DELETE and INSERT in one transaction. #}
+
+    {% do set_model_stage(
+        model_execution_id, 'MERGE_RUNNING'
+    ) %}
+
+    {% call statement('main', fetch_result=True, auto_begin=False) %}
+
+        EXECUTE IMMEDIATE $$
+        DECLARE
+            v_deleted NUMBER DEFAULT 0;
+            v_inserted NUMBER DEFAULT 0;
+        BEGIN
+
+            BEGIN TRANSACTION;
+
+            {{ delete_sql }};
+
+            v_deleted := SQLROWCOUNT;
+
+            {{ insert_sql }};
+
+            v_inserted := SQLROWCOUNT;
+
+            COMMIT;
+
+            RETURN TO_VARCHAR(v_deleted)
+                || '|' || TO_VARCHAR(v_inserted);
+
+        EXCEPTION
+            WHEN OTHER THEN
+                ROLLBACK;
+                RAISE;
+        END;
+        $$;
+
+    {% endcall %}
+
+
+    {# 10. Extract actual DELETE and INSERT counts. #}
+
+    {% set result = load_result('main') %}
+
+    {% set result_table = result['table'] %}
+
+    {% if result_table is none
+        or result_table.rows | length == 0 %}
+
+        {{ exceptions.raise_compiler_error(
+            'DELETE_INSERT: Transaction returned no DML counts.'
+        ) }}
+
+    {% endif %}
+
+    {% set returned_value = result_table.rows[0][0] | string %}
+    {% set parts = returned_value.split('|') %}
+
+    {% if parts | length != 2 %}
+
+        {{ exceptions.raise_compiler_error(
+            'DELETE_INSERT: Unexpected transaction result: '
+            ~ returned_value
+        ) }}
+
+    {% endif %}
+
+    {% set dml_stats = {
+        'rows_inserted': parts[1] | int,
+        'rows_updated': 0,
+        'rows_deleted': parts[0] | int
+    } %}
+
+    {% do log(
+        'DELETE_INSERT DML COMMITTED'
+        ~ ' | Deleted=' ~ dml_stats['rows_deleted']
+        ~ ' | Inserted=' ~ dml_stats['rows_inserted'],
+        info=true
+    ) %}
+
+
+    {# 11. Record committed DML statistics. #}
+
+    {% set after_result = run_query(
+        'SELECT COUNT(*) FROM ' ~ target_relation
+    ) %}
+
+    {% set target_after = after_result.rows[0][0] | int %}
+
+    {% do finish_model_stats(
+        model_execution_id,
+        dml_stats,
+        target_after
+    ) %}
+
+
+    {# 12. Execute DELETE_INSERT post-load validations. #}
+
+    {% set dq_result = run_delete_insert_post_load_checks(
+        source_relation,
+        target_relation,
+        cfg['natural_keys'],
+        model_execution_id,
+        etl_nr,
+        pre_results['source_row_count'],
+        target_before,
+        target_after,
+        expected_deleted,
+        dml_stats,
+        cfg['post_load']
+    ) %}
+
+
+    {# 13. Cleanup and finalize. #}
+
+    {% call statement('cleanup_source', auto_begin=False) %}
+        DROP TABLE IF EXISTS {{ source_relation }}
+    {% endcall %}
+
+    {{ run_hooks(post_hooks_to_run) }}
+
+    {% do adapter.commit() %}
+
+    {% if not dq_result['passed'] %}
+
+        {{ exceptions.raise_compiler_error(
+            'DELETE_INSERT: Post-load DQ failed after commit. '
+            ~ 'Failed checks: '
+            ~ (dq_result['failed_checks'] | join(', '))
+        ) }}
+
+    {% endif %}
+
+    {% do log(
+        'ENTERPRISE_LOAD DELETE_INSERT SUCCESS'
+        ~ ' | Target=' ~ target_relation
+        ~ ' | ETL_NR=' ~ etl_nr
+        ~ ' | Deleted=' ~ dml_stats['rows_deleted']
+        ~ ' | Inserted=' ~ dml_stats['rows_inserted']
+        ~ ' | Updated=' ~ dml_stats['rows_updated'],
+        info=true
+    ) %}
+
+    {% do return(target_relation) %}
+
+{% endmacro %}

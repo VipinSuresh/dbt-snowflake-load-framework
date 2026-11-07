@@ -1,0 +1,114 @@
+
+{# Enterprise load-only materialization.
+   One entry point for all supported loading strategies.
+   Governed targets are never recreated by this materialization.
+#}
+
+{% materialization enterprise_load, adapter='snowflake' %}
+
+    {# Full refresh is prohibited for governed targets. #}
+    {% if flags.FULL_REFRESH %}
+        {{ exceptions.raise_compiler_error(
+            'ENTERPRISE_LOAD: --full-refresh is not '
+            ~ 'supported for governed targets.'
+        ) }}
+    {% endif %}
+
+    {# Read and validate model configuration. #}
+    {% set meta_cfg = config.get('meta', {}) %}
+    {% set load_cfg = meta_cfg.get('enterprise_load', {}) %}
+
+    {% set cfg = validate_enterprise_config(load_cfg) %}
+
+    {# Route to the configured execution strategy. #}
+
+    {% if cfg['load_type'] == 'TYPE1' %}
+
+        {% set loaded_relation = execute_enterprise_type1(
+            cfg,
+            load_cfg,
+            model.unique_id,
+            model.name,
+            this,
+            compiled_code,
+            pre_hooks,
+            post_hooks
+        ) %}
+
+    {% elif cfg['load_type'] == 'TYPE2' %}
+
+        {% set loaded_relation = execute_enterprise_type2(
+            cfg,
+            model.unique_id,
+            model.name,
+            this,
+            compiled_code,
+            pre_hooks,
+            post_hooks
+        ) %}
+    
+    {% elif cfg['load_type'] == 'INSERT' %}
+
+    {% set loaded_relation = execute_enterprise_insert(
+        cfg,
+        load_cfg,
+        model.unique_id,
+        model.name,
+        this,
+        compiled_code,
+        pre_hooks,
+        post_hooks
+    ) %}
+
+    {% elif cfg['load_type'] == 'UPDATE' %}
+
+    {% set loaded_relation = execute_enterprise_update(
+        cfg,
+        load_cfg,
+        model.unique_id,
+        model.name,
+        this,
+        compiled_code,
+        pre_hooks,
+        post_hooks
+    ) %}  
+
+    {% elif cfg['load_type'] == 'TRUNCATE_LOAD' %}
+
+    {% set loaded_relation = execute_enterprise_truncate(
+        cfg,
+        load_cfg,
+        model.unique_id,
+        model.name,
+        this,
+        compiled_code,
+        pre_hooks,
+        post_hooks
+    ) %}  
+
+    {% elif cfg['load_type'] == 'DELETE_INSERT' %}
+
+    {% set loaded_relation = execute_enterprise_delete_insert(
+        cfg,
+        load_cfg,
+        model.unique_id,
+        model.name,
+        this,
+        compiled_code,
+        pre_hooks,
+        post_hooks
+    ) %}
+    
+    {% else %}
+
+        {{ exceptions.raise_compiler_error(
+            'ENTERPRISE_LOAD: This load type is not '
+            ~ 'implemented yet: ' ~ cfg['load_type']
+        ) }}
+
+    {% endif %}
+
+    {# Return the governed target relation to dbt. #}
+    {{ return({'relations': [loaded_relation]}) }}
+
+{% endmaterialization %}

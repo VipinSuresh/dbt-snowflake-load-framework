@@ -1,0 +1,29 @@
+    python3 - <<'PY'
+from pathlib import Path
+
+source = Path("macros/insert_load.sql").read_text()
+
+replacements = [
+    ("execute_enterprise_insert(", "execute_enterprise_update("),
+    ("target_relation_name, 'INSERT'", "target_relation_name, 'UPDATE'"),
+    ("generate_insert_merge_sql(", "generate_update_merge_sql("),
+    ("insert_only=true", "update_only=true"),
+    ("run_insert_post_load_checks(", "run_update_post_load_checks("),
+    ("ENTERPRISE_LOAD INSERT SUCCESS", "ENTERPRISE_LOAD UPDATE SUCCESS"),
+    ("INSERT: ", "UPDATE: "),
+]
+
+for old, new in replacements:
+    if old not in source:
+        raise SystemExit(f"Expected code not found: {old}")
+    source = source.replace(old, new)
+
+destination = Path("macros/update_load.sql")
+
+if destination.exists():
+    raise SystemExit("update_load.sql already exists; not overwriting.")
+
+destination.write_text(source)
+
+print("Created macros/update_load.sql")
+PY

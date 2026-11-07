@@ -1,0 +1,23 @@
+SELECT
+    CUSTOMER_ID,
+    CUSTOMER_NAME,
+
+    CASE
+    WHEN CUSTOMER_ID = 105
+        THEN 'raj.irvine@example.com'
+    ELSE EMAIL
+    END AS EMAIL,
+
+    CASE
+        WHEN CUSTOMER_ID = 105
+            THEN 'INACTIVE'
+        ELSE CUSTOMER_STATUS
+    END AS CUSTOMER_STATUS,
+
+    CASE
+        WHEN CUSTOMER_ID = 105
+            THEN 'Irvine'
+        ELSE CITY
+    END AS CITY
+
+FROM {{ ref('int_customers') }}
