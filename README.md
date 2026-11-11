@@ -1,8 +1,76 @@
 # Enterprise dbt + Snowflake Load Framework
 
-A configuration-driven dbt framework for loading existing, governed Snowflake tables with standardized execution behavior, data-quality controls, audit tracking, transactional safety, and regression testing.
+A configuration-driven **dbt + Snowflake reference implementation** for loading existing, governed target tables with six reusable load strategies, schema contracts, execution auditing, transactional commit gates, rollback-safe failure handling, and regression-tested concurrency behavior.
 
-The project demonstrates how multiple enterprise loading patterns can be implemented behind a common dbt materialization instead of maintaining separate one-off loading implementations for every model.
+The project is not primarily about writing six SQL loading patterns. It demonstrates the engineering problems that appear when those patterns are placed behind a common enterprise-style loading interface:
+
+- defining safe transaction boundaries
+- validating governed schemas before DML
+- separating commit gates from post-load observability
+- preserving failure evidence across rollback
+- handling stale concurrent executions
+- detecting corrupted target state
+- scoping reconciliation to execution-owned changes
+- serializing full replacements when the target may be empty
+
+> **Scope:** This repository is an enterprise-style reference implementation, not a drop-in production package for every Snowflake environment.
+
+---
+
+## What This Project Demonstrates
+
+A model selects a loading strategy through configuration while the custom `enterprise_load` materialization provides the common execution lifecycle.
+
+```text
+Model SQL
+   |
+   v
+Framework configuration
+   |
+   v
+Prepare execution source
+   |
+   v
+Pre-load validation
+   |
+   v
+Load executor
+   |
+   +---- multi-step strategies -------------------+
+   |                                              |
+   |   BEGIN TRANSACTION                          |
+   |        |                                     |
+   |        v                                     |
+   |      DML                                     |
+   |        |                                     |
+   |        v                                     |
+   |   Transaction-critical commit gates          |
+   |        |                                     |
+   |     PASS / FAIL                              |
+   |      |       |                               |
+   |      |       +-----------------> ROLLBACK    |
+   |      v                                       |
+   |    COMMIT                                    |
+   +----------------------------------------------+
+   |
+   v
+Post-load reconciliation
+   |
+   v
+Audit finalization
+```
+
+The key design distinction is:
+
+**Transaction-critical validation**  
+Small invariants that determine whether a multi-step business transaction is allowed to commit.
+
+**Post-load reconciliation**  
+Broader validation and observability that runs after the transaction commits.
+
+This keeps expensive checks out of the critical transaction where possible while still preserving strong correctness checks before commit.
+
+---
 
 ## Supported Load Strategies
 
@@ -15,113 +83,100 @@ The project demonstrates how multiple enterprise loading patterns can be impleme
 | `DELETE_INSERT` | Deletes matching target rows and inserts replacement rows |
 | `TRUNCATE_LOAD` | Replaces the complete target dataset |
 
-`TRUNCATE_LOAD` does not issue a Snowflake `TRUNCATE` statement.
-
-It uses transactional `DELETE + INSERT` so the replacement can participate in rollback behavior.
+`TRUNCATE_LOAD` does **not** execute Snowflake DDL `TRUNCATE`. It uses transactional `DELETE + INSERT` so the replacement can participate in rollback behavior.
 
 ---
 
-## Design Goals
+## Configuration Example
 
-The framework is designed around several principles:
+Model behavior is configured in YAML rather than implemented through separate custom materializations for each loading pattern.
+
+```yaml
+version: 2
+
+models:
+  - name: dim_customer
+    config:
+      materialized: enterprise_load
+      schema: MARTS
+
+      # Optional: use dbt's native alias when the governed physical
+      # table identifier differs from the dbt model name.
+      alias: DIM_CUSTOMER
+
+      meta:
+        enterprise_load:
+          load_type: TYPE1
+
+          natural_keys:
+            - CUSTOMER_ID
+
+          processing_window:
+            enabled: true
+            date_column: SOURCE_UPDATED_AT
+
+          pre_load:
+            column_match: true
+            require_nonempty: true
+            validate_keys: true
+
+            volume_threshold:
+              enabled: true
+              max_drop_pct: 40
+              max_growth_pct: 100
+
+          post_load:
+            reconcile_counts: true
+            duplicate_check: true
+            source_target_match: true
+```
+
+The framework operates on dbt's resolved `this` relation. Database, schema, and physical identifier therefore remain aligned with dbt's normal relation resolution. When a governed table name differs from the model name, dbt's native `alias` configuration can be used instead of introducing a second target-resolution mechanism.
+
+---
+
+## Design Principles
+
+The implementation is built around the following principles:
 
 - one reusable loading interface for multiple load patterns
 - configuration-driven behavior
-- existing governed target tables rather than automatic target creation
+- existing governed targets rather than automatic target creation
 - schema and datatype validation before DML
 - standardized execution and audit metadata
-- transaction-safe multi-step loading
+- explicit transactions for multi-step loading
 - rollback on critical failures
 - lightweight commit-gate validation inside transactions
 - broader reconciliation after commit
 - concurrency protection for high-risk multi-step operations
-- repeatable regression testing
+- repeatable positive, negative, edge-case, and concurrency regressions
+
+The materialization intentionally does **not** `CREATE OR REPLACE` governed final targets.
 
 ---
 
 ## Architecture
 
-The main framework components are:
-
 | Component | Responsibility |
 |---|---|
 | `enterprise_load.sql` | Custom materialization and strategy routing |
 | `framework_config.sql` | Framework configuration and validation |
-| `execution_context.sql` | Run-level execution context |
+| `execution_context.sql` | Run-level execution context and execution numbering |
 | `enterprise_control_relations.sql` | Control-object relation resolution |
-| `load_executors.sql` | Execution logic for the six strategies |
+| `load_executors.sql` | Execution lifecycle for the six strategies |
 | `load_strategies.sql` | Strategy-specific SQL generation |
-| `snowflake_dml.sql` | Snowflake DML utilities |
+| `snowflake_dml.sql` | Snowflake DML execution utilities |
 | `pre_load_checks.sql` | Pre-load contract and data validation |
 | `post_load_checks.sql` | Post-load reconciliation |
 | `audit_tracking.sql` | Model statistics and DQ audit persistence |
 | `processing_window.sql` | Optional processing-window validation |
-
-The framework operates against **existing physical Snowflake target tables**.
-
-It intentionally does not `CREATE OR REPLACE` governed final targets.
-
----
-
-## Execution Flow
-
-A typical framework execution follows this pattern:
-
-```text
-Model SQL
-   |
-   v
-Prepare immutable source
-   |
-   v
-Pre-load validation
-   |
-   v
-Execute load strategy
-   |
-   +---- transactional strategies ----+
-   |                                  |
-   |    BEGIN TRANSACTION             |
-   |          |                       |
-   |          v                       |
-   |        DML                       |
-   |          |                       |
-   |          v                       |
-   |    Critical commit gates         |
-   |          |                       |
-   |      PASS / FAIL                 |
-   |       |       |                  |
-   |       |       +--> ROLLBACK      |
-   |       v                          |
-   |     COMMIT                       |
-   +----------------------------------+
-   |
-   v
-Post-load reconciliation
-   |
-   v
-Audit finalization
-```
-
-The important distinction is between:
-
-**Transaction-critical validation**
-
-Small invariants that determine whether a transaction is allowed to commit.
-
-and:
-
-**Post-load reconciliation**
-
-Broader validation and observability that runs after the business transaction commits.
-
-This keeps expensive validation out of the critical transaction where possible.
+| `macros/regression/` | Regression setup and verification helpers |
 
 ---
 
 ## Pre-Load Validation
 
-The framework validates the source and target before modifying governed data.
+The framework validates source and target state before modifying governed data.
 
 Shared checks include:
 
@@ -135,8 +190,14 @@ Shared checks include:
 - required business-column NULL checks
 - existing target NULL keys
 - existing target duplicate keys
+- optional source-volume thresholds
+- optional processing-window validation
 
-TYPE2 additionally validates historical-state integrity, including:
+Schema incompatibility is rejected before business DML begins.
+
+### TYPE2 history validation
+
+TYPE2 adds historical-state checks including:
 
 - required SCD metadata
 - exactly one current row per key
@@ -146,7 +207,7 @@ TYPE2 additionally validates historical-state integrity, including:
 - history continuity
 - missing-current conditions
 
-Schema incompatibility is rejected before business DML begins.
+This means the framework does not assume an existing history table is valid simply because the incoming source is valid.
 
 ---
 
@@ -158,14 +219,15 @@ The multi-step strategies use explicit Snowflake transactions:
 - `DELETE_INSERT`
 - `TRUNCATE_LOAD`
 
-Example:
+Conceptually:
 
 ```text
 BEGIN
 
-DELETE / UPDATE
-INSERT
-critical validation
+DML step 1
+DML step 2
+
+transaction-critical validation
 
 COMMIT
 
@@ -174,31 +236,66 @@ EXCEPTION
     RAISE
 ```
 
-This prevents partial business-state changes when the second step or a transaction-critical validation fails.
+This prevents partial business-state changes when a later DML step or transaction-critical validation fails.
 
-Temporary objects used to prepare execution state are created outside the business transaction so DDL does not interfere with the intended transaction boundary.
+Temporary execution objects are prepared outside the business transaction so DDL does not interfere with the intended transaction boundary.
+
+---
+
+## TYPE1
+
+`TYPE1` inserts new natural keys and updates existing rows through a single load operation.
+
+The framework validates:
+
+- relation and schema contracts
+- source and target key quality
+- required business columns
+- optional volume thresholds
+
+Post-load checks can reconcile row-count behavior, duplicate-key state, and source/target matching.
 
 ---
 
 ## TYPE2
 
-TYPE2 processing prepares an immutable execution delta containing the rows that are:
+TYPE2 processing prepares an immutable execution delta containing rows that are:
 
 - new
 - changed
 
-Changed current records are expired and new versions are inserted in the same transaction.
+Changed current records are expired and new versions are inserted within the same business transaction.
 
 The framework maintains:
 
-- `VALID_FROM`
-- `VALID_TO`
-- `IS_CURRENT`
-- `VERSION_NO`
+```text
+VALID_FROM
+VALID_TO
+IS_CURRENT
+VERSION_NO
+```
 
-Transaction-critical checks protect the history from conditions such as duplicate versions or invalid execution-owned state before commit.
+Transaction-critical checks protect the history from invalid execution-owned state before commit. Broader history reconciliation runs after commit.
 
-Broader history reconciliation runs after commit.
+This separation matters under concurrency: a stale execution should fail before committing conflicting history, while unrelated concurrent changes should not create false failures.
+
+---
+
+## INSERT
+
+`INSERT` adds new natural keys without updating existing target rows.
+
+The strategy is intended for append-like governed targets where existing keys should remain unchanged.
+
+Regression coverage verifies positive inserts, execution audit behavior, and protection against invalid source state.
+
+---
+
+## UPDATE
+
+`UPDATE` modifies existing natural keys without inserting missing rows.
+
+Post-load validation confirms that the operation does not introduce unintended inserts or deletes and can reconcile execution-owned updates against the source.
 
 ---
 
@@ -215,31 +312,33 @@ validate transaction counts
 COMMIT
 ```
 
-If the transaction fails after the delete but before the insert completes, the delete is rolled back.
+If a failure occurs after the delete but before the transaction commits, the delete is rolled back.
+
+Concurrency validation is scoped to the affected execution state so unrelated distinct-key writers are not rejected by whole-table changes.
 
 ---
 
 ## TRUNCATE_LOAD
 
-The strategy performs full replacement using:
+`TRUNCATE_LOAD` performs full replacement using:
 
 ```text
 DELETE FROM target
 INSERT replacement snapshot
 ```
 
-instead of Snowflake DDL `TRUNCATE`.
+rather than Snowflake DDL `TRUNCATE`.
 
-Because a full replacement can begin against an empty target, relying only on locking existing target rows is insufficient.
+A full replacement can begin against an empty target, so locking only existing target rows is not sufficient for serialization.
 
-The framework therefore uses a framework-owned serialization control row:
+The framework therefore uses a framework-owned control row:
 
 ```text
 ETL_CONTROL.ETL_FRAMEWORK_LOCKS
 TRUNCATE_LOAD_GLOBAL
 ```
 
-The control row serializes competing full replacements before the governed target is modified.
+Competing full-replacement executions serialize on this control state before the governed target is modified.
 
 The current implementation intentionally uses a coarse global lock in favor of correctness and simplicity.
 
@@ -247,7 +346,7 @@ The current implementation intentionally uses a coarse global lock in favor of c
 
 ## Failure Handling
 
-The framework distinguishes between controlled validation failures and unexpected execution failures.
+The framework distinguishes controlled validation failures from unexpected execution failures.
 
 ### Controlled transaction-critical failure
 
@@ -260,32 +359,30 @@ business transaction
 separate audit transaction
     -> persist failure evidence
 
-re-raise original controlled failure
+re-raise controlled failure
 ```
 
-This allows failure audit evidence to survive the rollback of business DML.
+This allows failure audit evidence to survive rollback of the business DML.
 
 ### Unexpected SQL/runtime failure
 
 Unexpected Snowflake/database errors are rolled back by the transaction exception handler and re-raised.
 
-The dbt end hook conservatively records the model status as:
+The dbt end hook conservatively records:
 
 ```text
 LOAD_OUTCOME_UNKNOWN
 ```
 
-rather than assuming the exact outcome of an arbitrary database failure.
+rather than claiming certainty about the outcome of an arbitrary database failure.
 
-This is intentional: the audit layer should not claim certainty that it does not possess.
+That behavior is deliberate: the audit layer should not infer a database outcome it did not independently verify.
 
 ---
 
 ## Audit Model
 
 The framework maintains run-level, model-level, and DQ-level execution evidence.
-
-Primary control objects:
 
 | Object | Purpose |
 |---|---|
@@ -295,17 +392,19 @@ Primary control objects:
 | `ETL_NR_SEQ` | execution-number sequence |
 | `ETL_FRAMEWORK_LOCKS` | framework serialization control |
 
-Control-object setup is provided under:
+Control-object setup is provided in:
 
 ```text
 setup/create_etl_control_objects.sql
 ```
 
+The setup script creates missing framework control objects without creating arbitrary governed business targets.
+
 ---
 
 ## Standardized Target Audit Columns
 
-The public demo uses standardized target audit metadata including:
+The public demo uses eight standardized target audit fields:
 
 ```text
 CREATED_BY_PROCESS
@@ -318,17 +417,57 @@ ETL_UPDATED_RUN_NUMBER
 ETL_UPDATED_AT
 ```
 
-These columns allow loaded records to be associated with framework executions.
+These fields associate target rows with framework executions while keeping the public example independent of organization-specific naming conventions.
+
+---
+
+## Execution Context
+
+The framework supports run identification and execution metadata for local dbt Core execution and dbt Cloud-style execution context.
+
+Run lifecycle hooks initialize and finalize framework tracking:
+
+```yaml
+on-run-start:
+  - "{{ start_etl_run() }}"
+
+on-run-end:
+  - "{{ finish_etl_run() }}"
+```
+
+Control schemas are resolved through project variables:
+
+```yaml
+vars:
+  enterprise_control_schema: ETL_CONTROL
+  enterprise_regression_schema: REGRESSION_TEST
+```
+
+---
+
+## Processing Window
+
+Models may declare an optional processing window configuration.
+
+```yaml
+processing_window:
+  enabled: true
+  date_column: SOURCE_UPDATED_AT
+```
+
+The framework validates the declared runtime window and records the validation result. The window declaration itself does not automatically rewrite model SQL; source filtering remains the responsibility of the model.
+
+`TRUNCATE_LOAD` prohibits an enabled processing window because it represents a complete replacement rather than a partial-window load.
 
 ---
 
 ## Concurrency
 
-Concurrency testing focused on the multi-step strategies where stale execution state can cause the most serious correctness problems.
+Concurrency testing focuses on the multi-step strategies where stale execution state creates the highest correctness risk.
 
 ### TYPE2
 
-Testing covered:
+Testing covers:
 
 - competing runs affecting the same natural key
 - competing runs affecting distinct keys
@@ -336,11 +475,11 @@ Testing covered:
 
 Same-key stale writers are rejected before commit.
 
-Distinct-key runs are not incorrectly failed by whole-table reconciliation belonging to another execution.
+Distinct-key runs are not incorrectly failed by reconciliation belonging to unrelated concurrent state.
 
 ### DELETE_INSERT
 
-Testing covered:
+Testing covers:
 
 - overlapping-key concurrent execution
 - distinct-key concurrent execution
@@ -349,7 +488,7 @@ Validation is scoped to execution-owned or affected-key state rather than unrela
 
 ### TRUNCATE_LOAD
 
-Testing covered:
+Testing covers:
 
 - concurrent same-count replacement
 - empty-target replacement
@@ -363,9 +502,9 @@ Concurrency behavior for single-statement `TYPE1`, `INSERT`, and `UPDATE` has no
 
 ## Regression Coverage
 
-The project includes regression coverage for all six supported strategies.
+The repository includes regressions for all six supported strategies plus targeted reliability and edge-case suites.
 
-The test suite includes:
+Coverage includes:
 
 - normal TYPE1 behavior
 - normal TYPE2 behavior
@@ -376,9 +515,12 @@ The test suite includes:
 - transaction rollback
 - transaction-critical DQ failure
 - failure audit persistence
-- TYPE2 concurrency
-- DELETE_INSERT concurrency
+- TYPE2 same-key concurrency
+- TYPE2 distinct-key concurrency
+- DELETE_INSERT overlapping-key concurrency
+- DELETE_INSERT distinct-key concurrency
 - TRUNCATE_LOAD concurrency
+- empty-target full-replacement serialization
 - composite natural keys
 - NULL composite-key components
 - duplicate composite keys
@@ -400,6 +542,21 @@ python scripts/run_all_regressions.py
 ```
 
 Additional targeted runners are available under `scripts/`.
+
+Examples include:
+
+```text
+run_concurrency_type2.py
+run_concurrency_type2_distinct_keys.py
+run_concurrency_delete_insert.py
+run_concurrency_delete_insert_distinct_keys.py
+run_concurrency_truncate_load.py
+run_concurrency_truncate_load_empty.py
+run_edge_composite_keys.py
+run_edge_schema_drift.py
+run_edge_target_corruption.py
+run_edge_runtime_failure.py
+```
 
 ---
 
@@ -434,6 +591,54 @@ Additional targeted runners are available under `scripts/`.
 
 ---
 
+## Setup
+
+### 1. Configure a Snowflake dbt profile
+
+Configure the project to connect to the intended development Snowflake environment.
+
+### 2. Create the framework control objects
+
+Execute:
+
+```text
+setup/create_etl_control_objects.sql
+```
+
+Select the intended database first and ensure the configured control schema matches `enterprise_control_schema`.
+
+### 3. Provision source and governed target tables
+
+The framework expects governed targets to exist before a model runs.
+
+It intentionally does not create or replace arbitrary business target tables.
+
+### 4. Configure the load strategy
+
+Set:
+
+- `materialized: enterprise_load`
+- the desired `load_type`
+- `natural_keys`
+- applicable pre-load controls
+- applicable post-load controls
+- optional processing-window metadata
+
+### 5. Validate dbt connectivity and execute
+
+```bash
+dbt debug
+dbt run
+```
+
+For the bundled regression suite:
+
+```bash
+python scripts/run_all_regressions.py
+```
+
+---
+
 ## Environment Used for Validation
 
 The framework has been exercised locally using:
@@ -449,86 +654,38 @@ Other dbt Core, adapter, Python, or Snowflake environment combinations have not 
 
 ---
 
-## Configuration
-
-The project resolves framework control objects through dbt variables:
-
-```yaml
-vars:
-  enterprise_control_schema: ETL_CONTROL
-  enterprise_regression_schema: REGRESSION_TEST
-```
-
-Run lifecycle hooks initialize and finalize execution tracking:
-
-```yaml
-on-run-start:
-  - "{{ start_etl_run() }}"
-
-on-run-end:
-  - "{{ finish_etl_run() }}"
-```
-
-Individual model behavior is driven through framework configuration rather than separate custom materializations for each loading strategy.
-
----
-
-## Setup
-
-1. Configure a Snowflake dbt profile.
-2. Create the framework control objects using:
-
-```text
-setup/create_etl_control_objects.sql
-```
-
-3. Provision the required source and governed target tables.
-4. Configure the appropriate load strategy and natural keys.
-5. Run dbt normally.
-
-Example:
-
-```bash
-dbt debug
-dbt run
-```
-
-The setup SQL intentionally does not create arbitrary governed target tables.
-
----
-
 ## Important Limitations
 
-This repository demonstrates framework architecture and correctness patterns. It is not presented as a drop-in production package for every Snowflake environment.
+This repository demonstrates framework architecture and correctness patterns. It is not presented as a universally production-ready package.
 
-Current limitations include:
+Current boundaries include:
 
 - no systematic large-scale performance benchmark
 - no compatibility matrix across dbt/dbt-snowflake versions
-- no dedicated concurrency regression for TYPE1, INSERT, or UPDATE
+- no dedicated concurrency regression for `TYPE1`, `INSERT`, or `UPDATE`
 - no dedicated regression specifically for empty-source behavior
 - no exhaustive late-arriving TYPE2 scenario suite
-- TRUNCATE_LOAD currently uses coarse global serialization
+- `TRUNCATE_LOAD` currently uses coarse global serialization
 - deployment, permissions, monitoring, alerting, and operational controls must be adapted to the target organization
 
-These are intentional boundaries of the current project rather than claims of unsupported behavior.
+These are explicit boundaries of the current reference implementation rather than claims of behavior that has not been tested.
 
 ---
 
-## Why This Project Exists
+## Why the Reliability Layer Matters
 
-The main goal is not simply to demonstrate six SQL loading patterns.
+A load strategy is easy to describe when only the happy path is considered.
 
-The project explores the engineering problems that appear when those patterns become a reusable enterprise framework:
+The difficult engineering questions are different:
 
-- defining transaction boundaries
-- separating commit gates from post-load observability
-- preserving failure audit evidence across rollback
-- handling stale concurrent executions
-- validating governed schemas before DML
-- detecting corrupted historical state
-- designing execution-scoped reconciliation
-- handling empty-target serialization
-- responding safely to unexpected database errors
+- What state is allowed to commit?
+- Which checks belong inside the transaction?
+- Which checks should run after commit?
+- What happens when step two fails after step one succeeds?
+- How is failure evidence retained after rollback?
+- What happens when two runs start from the same baseline?
+- How should validation distinguish execution-owned state from unrelated concurrent changes?
+- How should a full replacement serialize when the target is empty?
+- What should the audit layer claim after an unexpected database error?
 
 Those concerns are what turn a collection of SQL statements into a reusable data-engineering framework.
