@@ -1,9 +1,0 @@
--- Business columns only. The enterprise_load TYPE2 materialization manages
--- VALID_FROM, VALID_TO, IS_CURRENT, VERSION_NO and all eight audit columns.
-SELECT
-    CUSTOMER_ID,
-    CUSTOMER_NAME,
-    EMAIL,
-    CUSTOMER_STATUS,
-    CITY
-FROM {{ ref('int_customers') }}

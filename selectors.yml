@@ -1,0 +1,12 @@
+selectors:
+  - name: safe_default
+    description: Exclude demonstration and regression models from default execution
+    default: true
+    definition:
+      method: fqn
+      value: "*"
+      exclude:
+        - method: path
+          value: models/demo
+        - method: path
+          value: models/regression

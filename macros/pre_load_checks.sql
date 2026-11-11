@@ -376,26 +376,6 @@
     }) %}
 {% endmacro %}
 
-
-{# Standalone wrapper retained for isolated checks; raises errors like earlier demo. #}
-{% macro demo_check_pre_load(source_identifier='INT_CUSTOMERS') %}
-    {% set src = adapter.get_relation(
-        database='DBT_DEMO', schema='DBT_WORK', identifier=source_identifier
-    ) %}
-    {% set tgt = adapter.get_relation(
-        database='DBT_DEMO', schema='MARTS', identifier='DIM_CUSTOMER'
-    ) %}
-    {% set result = check_pre_load(src, tgt, ['CUSTOMER_ID'], true) %}
-    {% if not result['passed'] %}
-        {{ exceptions.raise_compiler_error(
-            'PRE_LOAD: Failed checks: ' ~ (result['failed_checks'] | join(', '))
-        ) }}
-    {% endif %}
-    {% do log('PRE_LOAD PASSED | Source=' ~ src ~ ' | Target=' ~ tgt
-        ~ ' | Rows=' ~ result['source_row_count'], info=true) %}
-{% endmacro %}
-
-
 {# ===== From: macros/source_volume_threshold.sql | definition bodies unchanged ===== #}
 {# Optional pre-load source volume guard using the immediately preceding successful model run. #}
 {# Failure blocks the MERGE. Baseline is a completed successful run with passed DQ. #}
@@ -403,7 +383,7 @@
 {% macro record_source_volume_baseline_skip(model_execution_id, etl_nr, detail) %}
     {% set safe_detail = (detail | string | replace("'", "''"))[:1900] %}
     {% set sql %}
-        INSERT INTO DBT_DEMO.ETL_CONTROL.ETL_DQ_RESULTS
+        INSERT INTO {{ enterprise_control_relation('ETL_DQ_RESULTS') }}
         (
             DQ_RESULT_ID, MODEL_EXECUTION_ID, ETL_NR,
             CHECK_NAME, CHECK_PHASE, CHECK_STATUS,
@@ -466,8 +446,8 @@
     {% set safe_model = (model_id | string) | replace("'", "''") %}
     {% set baseline_sql %}
         SELECT m.SOURCE_ROW_COUNT
-        FROM DBT_DEMO.ETL_CONTROL.ETL_MODEL_STATS m
-        JOIN DBT_DEMO.ETL_CONTROL.ETL_RUN_CONTROL r
+        FROM {{ enterprise_control_relation('ETL_MODEL_STATS') }} m
+        JOIN {{ enterprise_control_relation('ETL_RUN_CONTROL') }} r
           ON m.ETL_NR = r.ETL_NR
         WHERE m.DBT_MODEL_ID = '{{ safe_model }}'
           AND m.MODEL_EXECUTION_ID <> '{{ model_execution_id }}'

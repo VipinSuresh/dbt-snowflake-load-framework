@@ -15,7 +15,8 @@
         'load_type',
         'natural_keys',
         'pre_load',
-        'post_load'
+        'post_load',
+        'processing_window'
     ] %}
 
     {% for option in load_cfg.keys() %}
@@ -307,6 +308,45 @@
     {% endif %}
 
 
+    {# 6. Optional processing-window tracking (no filtering performed here). #}
+
+    {% set window = load_cfg.get('processing_window', {}) %}
+
+    {% if window is not mapping %}
+        {{ exceptions.raise_compiler_error(
+            'ENTERPRISE_LOAD: processing_window must be a dictionary.'
+        ) }}
+    {% endif %}
+
+    {% for option in window.keys() %}
+        {% if option not in ['enabled', 'date_column'] %}
+            {{ exceptions.raise_compiler_error(
+                'ENTERPRISE_LOAD: Unsupported processing_window option: ' ~ option
+            ) }}
+        {% endif %}
+    {% endfor %}
+
+    {% set window_enabled = window.get('enabled', false) %}
+    {% if window_enabled is not sameas true and window_enabled is not sameas false %}
+        {{ exceptions.raise_compiler_error(
+            'ENTERPRISE_LOAD: processing_window.enabled must be true or false.'
+        ) }}
+    {% endif %}
+
+    {% set window_date_column = window.get('date_column', none) %}
+    {% if window_enabled %}
+        {% if window_date_column is not string or (window_date_column | trim) == '' %}
+            {{ exceptions.raise_compiler_error(
+                'ENTERPRISE_LOAD: processing_window.date_column is required when enabled.'
+            ) }}
+        {% endif %}
+        {% if load_type == 'TRUNCATE_LOAD' %}
+            {{ exceptions.raise_compiler_error(
+                'TRUNCATE_LOAD: processing_window.enabled=true is prohibited for full replacement.'
+            ) }}
+        {% endif %}
+    {% endif %}
+
     {# 6. Return normalized enterprise configuration. #}
 
     {% set normalized = {
@@ -322,6 +362,10 @@
             'reconcile_counts': reconcile_counts,
             'duplicate_check': true,
             'source_target_match': source_target_match
+        },
+        'processing_window': {
+            'enabled': window_enabled,
+            'date_column': (window_date_column | trim | upper) if window_enabled else none
         }
     } %}
 

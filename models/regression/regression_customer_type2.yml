@@ -1,0 +1,31 @@
+version: 2
+
+models:
+  - name: regression_customer_type2
+    config:
+      materialized: enterprise_load
+      database: "{{ var('enterprise_regression_database', target.database) }}"
+      schema: "{{ var('enterprise_regression_schema', 'REGRESSION_TEST') }}"
+      alias: DIM_CUSTOMER_TYPE2_TEST
+
+      meta:
+        enterprise_load:
+          load_type: TYPE2
+
+          natural_keys:
+
+            - CUSTOMER_ID
+          processing_window:
+            enabled: false
+
+          pre_load:
+            column_match: true
+            require_nonempty: true
+            validate_keys: true
+            volume_threshold:
+              enabled: false
+
+          post_load:
+            reconcile_counts: true
+            duplicate_check: true
+            source_target_match: true

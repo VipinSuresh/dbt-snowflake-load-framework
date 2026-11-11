@@ -165,57 +165,6 @@
 
 {% endmacro %}
 
-
-{# Preview wrapper — generates SQL without executing it #}
-
-{% macro demo_preview_type1_merge() %}
-
-    {% set source_relation = adapter.get_relation(
-        database='DBT_DEMO',
-        schema='DBT_WORK',
-        identifier='INT_CUSTOMERS'
-    ) %}
-
-    {% set target_relation = adapter.get_relation(
-        database='DBT_DEMO',
-        schema='MARTS',
-        identifier='DIM_CUSTOMER'
-    ) %}
-
-    {% if source_relation is none or target_relation is none %}
-        {{ exceptions.raise_compiler_error(
-            'DEMO: Source or target relation is missing.'
-        ) }}
-    {% endif %}
-
-    {# Reuse the pre-load validation already tested #}
-
-    {% do check_pre_load(
-        source_relation,
-        target_relation,
-        ['CUSTOMER_ID'],
-        true
-    ) %}
-
-    {# ETL number is a preview placeholder here #}
-
-    {% set merge_sql = generate_type1_merge_sql(
-        source_relation,
-        target_relation,
-        ['CUSTOMER_ID'],
-        1001,
-        'enterprise_dbt_framework'
-    ) %}
-
-    {% do log(
-        'TYPE1 MERGE SQL PREVIEW — NOT EXECUTED:\n'
-        ~ merge_sql,
-        info=true
-    ) %}
-
-{% endmacro %}
-
-
 {# ===== From: macros/insert_strategy.sql | definition bodies unchanged ===== #}
 
 {# Generate INSERT-only MERGE for an existing governed Snowflake target. #}

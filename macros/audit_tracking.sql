@@ -3,7 +3,7 @@
 {% macro get_current_etl_nr() %}
     {% set sql %}
         SELECT ETL_NR
-        FROM DBT_DEMO.ETL_CONTROL.ETL_RUN_CONTROL
+        FROM {{ enterprise_control_relation('ETL_RUN_CONTROL') }}
         WHERE DBT_INVOCATION_ID = '{{ invocation_id }}'
     {% endset %}
     {% set result = run_query(sql) %}
@@ -30,7 +30,7 @@
     {% set target_sql = 'NULL' if target_before is none else (target_before | int | string) %}
     {% set now_utc = "CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ(9)" %}
     {% set sql %}
-        INSERT INTO DBT_DEMO.ETL_CONTROL.ETL_MODEL_STATS
+        INSERT INTO {{ enterprise_control_relation('ETL_MODEL_STATS') }}
         (
             MODEL_EXECUTION_ID, ETL_NR, DBT_MODEL_ID, TARGET_RELATION,
             LOAD_TYPE, SOURCE_ROW_COUNT, TARGET_ROWS_BEFORE,
@@ -53,7 +53,7 @@
         {{ exceptions.raise_compiler_error('ETL: Invalid model stage: ' ~ stage) }}
     {% endif %}
     {% set sql %}
-        UPDATE DBT_DEMO.ETL_CONTROL.ETL_MODEL_STATS
+        UPDATE {{ enterprise_control_relation('ETL_MODEL_STATS') }}
         SET LOAD_STATUS = '{{ stage }}'
         WHERE MODEL_EXECUTION_ID = '{{ model_execution_id }}'
     {% endset %}
@@ -63,7 +63,7 @@
 
 {% macro mark_pre_load_passed(model_execution_id, source_count, target_before) %}
     {% set sql %}
-        UPDATE DBT_DEMO.ETL_CONTROL.ETL_MODEL_STATS
+        UPDATE {{ enterprise_control_relation('ETL_MODEL_STATS') }}
         SET
             SOURCE_ROW_COUNT = {{ source_count | int }},
             TARGET_ROWS_BEFORE = {{ target_before | int }},
@@ -79,7 +79,7 @@
     {% set safe_error = (error_text | replace("'", "''"))[:3900] %}
     {% set source_sql = 'NULL' if source_count is none else (source_count | int | string) %}
     {% set sql %}
-        UPDATE DBT_DEMO.ETL_CONTROL.ETL_MODEL_STATS
+        UPDATE {{ enterprise_control_relation('ETL_MODEL_STATS') }}
         SET
             SOURCE_ROW_COUNT = {{ source_sql }},
             LOAD_STATUS = 'PRE_LOAD_FAILED',
@@ -103,7 +103,7 @@
     {% set safe_name = (check_name | string) | replace("'", "''") %}
     {% set safe_detail = (detail | string | replace("'", "''"))[:1900] %}
     {% set sql %}
-        INSERT INTO DBT_DEMO.ETL_CONTROL.ETL_DQ_RESULTS
+        INSERT INTO {{ enterprise_control_relation('ETL_DQ_RESULTS') }}
         (
             DQ_RESULT_ID, MODEL_EXECUTION_ID, ETL_NR,
             CHECK_NAME, CHECK_PHASE, CHECK_STATUS,
@@ -126,7 +126,7 @@
 {% macro finish_model_stats(model_execution_id, dml_stats, target_after) %}
     {% set now_utc = "CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ(9)" %}
     {% set sql %}
-        UPDATE DBT_DEMO.ETL_CONTROL.ETL_MODEL_STATS
+        UPDATE {{ enterprise_control_relation('ETL_MODEL_STATS') }}
         SET
             ROWS_INSERTED = {{ dml_stats['rows_inserted'] | int }},
             ROWS_UPDATED = {{ dml_stats['rows_updated'] | int }},
@@ -148,7 +148,7 @@
 ) %}
     {% set check_status = 'PASS' if observed_value == reference_value else 'FAIL' %}
     {% set sql %}
-        INSERT INTO DBT_DEMO.ETL_CONTROL.ETL_DQ_RESULTS
+        INSERT INTO {{ enterprise_control_relation('ETL_DQ_RESULTS') }}
         (
             DQ_RESULT_ID, MODEL_EXECUTION_ID, ETL_NR,
             CHECK_NAME, CHECK_PHASE, CHECK_STATUS,
@@ -171,7 +171,7 @@
     {% set dq_status = 'PASS' if passed else 'FAIL' %}
     {% set load_status = 'SUCCESS' if passed else 'LOAD_COMMITTED_DQ_FAILED' %}
     {% set sql %}
-        UPDATE DBT_DEMO.ETL_CONTROL.ETL_MODEL_STATS
+        UPDATE {{ enterprise_control_relation('ETL_MODEL_STATS') }}
         SET
             DQ_STATUS = '{{ dq_status }}',
             LOAD_STATUS = '{{ load_status }}',
@@ -179,4 +179,87 @@
         WHERE MODEL_EXECUTION_ID = '{{ model_execution_id }}'
     {% endset %}
     {% do run_query(sql) %}
+{% endmacro %}
+
+
+{# Optional processing-window audit. No table changes: DETAILS is already VARIANT. #}
+{% macro record_processing_window_check(model_execution_id, etl_nr, passed, date_column,
+                                        start_date=none, end_date=none, reason='') %}
+    {% set status = 'PASS' if passed else 'FAIL' %}
+    {% set safe_column = (date_column | string | replace("'", "''"))[:200] %}
+    {% set safe_reason = (reason | string | replace("'", "''"))[:1300] %}
+    {% set start_literal = 'NULL' if start_date is none else "'" ~ (start_date | string | replace("'", "''"))[:100] ~ "'" %}
+    {% set end_literal = 'NULL' if end_date is none else "'" ~ (end_date | string | replace("'", "''"))[:100] ~ "'" %}
+    {% set audit_sql %}
+        INSERT INTO {{ enterprise_control_relation('ETL_DQ_RESULTS') }}
+        (
+            DQ_RESULT_ID, MODEL_EXECUTION_ID, ETL_NR,
+            CHECK_NAME, CHECK_PHASE, CHECK_STATUS,
+            OBSERVED_VALUE, REFERENCE_VALUE, DETAILS, CHECKED_AT
+        )
+        SELECT UUID_STRING(), '{{ model_execution_id }}', {{ etl_nr }},
+               'PROCESSING_WINDOW', 'PRE_LOAD', '{{ status }}',
+               {{ 1 if passed else 0 }}, 1,
+               OBJECT_CONSTRUCT_KEEP_NULL(
+                   'date_column', '{{ safe_column }}',
+                   'start_date', {{ start_literal }},
+                   'end_date', {{ end_literal }},
+                   'end_exclusive', TRUE,
+                   'source_filter_verified', FALSE,
+                   'message', '{{ safe_reason }}'
+               ),
+               CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ(9)
+    {% endset %}
+    {% do run_query(audit_sql) %}
+    {% do log('PRE_LOAD PROCESSING_WINDOW | ' ~ status ~ ' | ' ~ reason, info=true) %}
+{% endmacro %}
+
+{# Persist transaction-critical DQ evidence only AFTER the business DML rollback.
+   This macro renders SQL for use inside a Snowflake Scripting exception handler;
+   it intentionally does not call run_query itself. #}
+{% macro transaction_dq_failure_audit_sql(
+    model_execution_id,
+    etl_nr,
+    check_name,
+    load_type,
+    reason_expression=':v_failure_reason'
+) %}
+
+    UPDATE {{ enterprise_control_relation('ETL_MODEL_STATS') }}
+    SET
+        LOAD_STATUS = 'TRANSACTION_DQ_FAILED',
+        DQ_STATUS = 'FAIL',
+        ERROR_MESSAGE = LEFT(
+            'Transaction-critical DQ failed: '
+            || COALESCE({{ reason_expression }}, 'UNKNOWN'),
+            4000
+        ),
+        FINISHED_AT =
+            CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ(9)
+    WHERE MODEL_EXECUTION_ID = '{{ model_execution_id }}';
+
+    INSERT INTO {{ enterprise_control_relation('ETL_DQ_RESULTS') }}
+    (
+        DQ_RESULT_ID, MODEL_EXECUTION_ID, ETL_NR,
+        CHECK_NAME, CHECK_PHASE, CHECK_STATUS,
+        OBSERVED_VALUE, REFERENCE_VALUE, DETAILS, CHECKED_AT
+    )
+    SELECT
+        UUID_STRING(),
+        '{{ model_execution_id }}',
+        {{ etl_nr }},
+        '{{ check_name }}',
+        'TRANSACTION',
+        'FAIL',
+        0,
+        1,
+        OBJECT_CONSTRUCT(
+            'load_type', '{{ load_type }}',
+            'reason', COALESCE({{ reason_expression }}, 'UNKNOWN'),
+            'message',
+                'Transaction-critical DQ failed: '
+                || COALESCE({{ reason_expression }}, 'UNKNOWN')
+        ),
+        CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ(9);
+
 {% endmacro %}

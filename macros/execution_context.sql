@@ -1,13 +1,13 @@
 {# dbt invocation/run control. One sequence-generated ETL_NR per command. #}
 
 {% macro start_etl_run() %}
-    INSERT INTO DBT_DEMO.ETL_CONTROL.ETL_RUN_CONTROL
+    INSERT INTO {{ enterprise_control_relation('ETL_RUN_CONTROL') }}
     (
         ETL_NR, DBT_INVOCATION_ID, EXECUTION_SOURCE,
         JOB_NAME, DBT_TARGET_NAME, RUN_STARTED_AT, RUN_STATUS
     )
     SELECT
-        DBT_DEMO.ETL_CONTROL.ETL_NR_SEQ.NEXTVAL,
+        {{ enterprise_control_relation('ETL_NR_SEQ') }}.NEXTVAL,
         '{{ invocation_id }}',
         'DBT_CORE',
         '{{ project_name }}',
@@ -16,7 +16,7 @@
         'RUNNING'
     WHERE NOT EXISTS (
         SELECT 1
-        FROM DBT_DEMO.ETL_CONTROL.ETL_RUN_CONTROL
+        FROM {{ enterprise_control_relation('ETL_RUN_CONTROL') }}
         WHERE DBT_INVOCATION_ID = '{{ invocation_id }}'
     )
 {% endmacro %}
@@ -42,7 +42,7 @@
                 {% set reason = (result.message | default('dbt model execution failed', true)) | string %}
                 {% set safe_reason = (reason | replace("'", "''"))[:3900] %}
                 {% set repair_sql %}
-                    UPDATE DBT_DEMO.ETL_CONTROL.ETL_MODEL_STATS
+                    UPDATE {{ enterprise_control_relation('ETL_MODEL_STATS') }}
                     SET
                         LOAD_STATUS = CASE
                             WHEN LOAD_STATUS IN ('PREPARING', 'PRE_LOAD_RUNNING')
@@ -69,7 +69,7 @@
                         )
                     WHERE ETL_NR = (
                         SELECT ETL_NR
-                        FROM DBT_DEMO.ETL_CONTROL.ETL_RUN_CONTROL
+                        FROM {{ enterprise_control_relation('ETL_RUN_CONTROL') }}
                         WHERE DBT_INVOCATION_ID = '{{ invocation_id }}'
                     )
                     AND DBT_MODEL_ID = '{{ safe_model }}'
@@ -82,7 +82,7 @@
     {% set combined_error = failure_messages | join(' | ') %}
     {% set safe_run_error = (combined_error | replace("'", "''"))[:3900] %}
 
-    UPDATE DBT_DEMO.ETL_CONTROL.ETL_RUN_CONTROL
+    UPDATE {{ enterprise_control_relation('ETL_RUN_CONTROL') }}
     SET
     RUN_ENDED_AT = CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ(9),
     RUN_STATUS = '{{ "FAILED" if failed | length > 0 else "SUCCESS" }}',

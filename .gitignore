@@ -1,5 +1,35 @@
-
+# dbt generated files
 target/
-dbt_packages/
 logs/
+dbt_packages/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+dbt-env/
+
+# Credentials and local configuration
 .env
+.env.*
+!.env.example
+profiles.yml
+*.pem
+*.key
+
+# Local backups and old development versions
+macros_backup/
+macros_before_consolidation/
+type2_backup/
+*.sql.backup*
+*.sql.bad_copy
+framework_consolidation.zip
+framework_dq_review.zip
+
+# macOS
+.DS_Store
+
+# Regression/concurrency generated output
+target_*/
+logs_*/

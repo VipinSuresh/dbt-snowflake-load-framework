@@ -2,7 +2,7 @@
 {# Post-load DQ evidence; SKIP is explicit for disabled optional checks. #}
 {% macro record_skipped_post_load_check(model_execution_id, etl_nr, check_name) %}
     {% set skip_sql %}
-        INSERT INTO DBT_DEMO.ETL_CONTROL.ETL_DQ_RESULTS
+        INSERT INTO {{ enterprise_control_relation('ETL_DQ_RESULTS') }}
         (
             DQ_RESULT_ID,
             MODEL_EXECUTION_ID,
@@ -173,7 +173,7 @@
 {% macro record_type2_post_check(model_execution_id, etl_nr, check_name, observed, expected) %}
   {% set status = 'PASS' if observed == expected else 'FAIL' %}
   {% set sql %}
-    INSERT INTO DBT_DEMO.ETL_CONTROL.ETL_DQ_RESULTS
+    INSERT INTO {{ enterprise_control_relation('ETL_DQ_RESULTS') }}
     (DQ_RESULT_ID, MODEL_EXECUTION_ID, ETL_NR, CHECK_NAME, CHECK_PHASE,
      CHECK_STATUS, OBSERVED_VALUE, REFERENCE_VALUE, DETAILS, CHECKED_AT)
     SELECT UUID_STRING(), '{{ model_execution_id }}', {{ etl_nr }},
@@ -189,7 +189,7 @@
 
 {% macro record_type2_skip(model_execution_id, etl_nr, check_name) %}
   {% set sql %}
-    INSERT INTO DBT_DEMO.ETL_CONTROL.ETL_DQ_RESULTS
+    INSERT INTO {{ enterprise_control_relation('ETL_DQ_RESULTS') }}
     (DQ_RESULT_ID, MODEL_EXECUTION_ID, ETL_NR, CHECK_NAME, CHECK_PHASE,
      CHECK_STATUS, OBSERVED_VALUE, REFERENCE_VALUE, DETAILS, CHECKED_AT)
     SELECT UUID_STRING(), '{{ model_execution_id }}', {{ etl_nr }},
@@ -202,31 +202,47 @@
 {% endmacro %}
 
 
-{% macro run_type2_post_load_checks(source_relation, target_relation, natural_keys,
-      model_execution_id, etl_nr, target_before, target_after, dml_stats, post_cfg) %}
+{% macro run_type2_post_load_checks(source_relation, target_relation, affected_relation, natural_keys,
+      model_execution_id, etl_nr, affected_before, affected_after, dml_stats, post_cfg) %}
   {% set failures = [] %}
   {% set keys = [] %}
   {% set join_on = [] %}
+  {% set source_affected_join = [] %}
+  {% set target_affected_join = [] %}
   {% for key in natural_keys %}
     {% set q = adapter.quote(key) %}
     {% do keys.append(q) %}
     {% do join_on.append('s.' ~ q ~ ' = t.' ~ q) %}
+    {% do source_affected_join.append('s.' ~ q ~ ' = d.' ~ q) %}
+    {% do target_affected_join.append('t.' ~ q ~ ' = d.' ~ q) %}
   {% endfor %}
+  {% set target_affected_predicate = 'EXISTS (SELECT 1 FROM ' ~ affected_relation
+      ~ ' d WHERE ' ~ (target_affected_join | join(' AND ')) ~ ')' %}
+  {% set source_affected_predicate = 'EXISTS (SELECT 1 FROM ' ~ affected_relation
+      ~ ' d WHERE ' ~ (source_affected_join | join(' AND ')) ~ ')' %}
 
+  {# Post-load success is execution-scoped. Whole-table row counts are not
+     stable under legitimate concurrent writers, so reconcile only history
+     rows belonging to natural keys in this invocation's immutable delta. #}
   {% if post_cfg['reconcile_counts'] %}
-    {% set expected = target_before + dml_stats['rows_inserted'] %}
+    {% set expected = affected_before + dml_stats['rows_inserted'] %}
     {% set status = record_type2_post_check(model_execution_id, etl_nr,
-      'TYPE2_HISTORY_ROW_DELTA', target_after, expected) %}
+      'TYPE2_HISTORY_ROW_DELTA', affected_after, expected) %}
     {% if status == 'FAIL' %}{% do failures.append('TYPE2_HISTORY_ROW_DELTA') %}{% endif %}
   {% else %}
     {% do record_type2_skip(model_execution_id, etl_nr, 'TYPE2_HISTORY_ROW_DELTA') %}
   {% endif %}
 
-  {# Exactly one current record for every known natural key. #}
+  {# The whole target was validated before DML. After commit, validate the
+     history this invocation owned so unrelated concurrent keys cannot make
+     this run fail after its own transaction succeeded. #}
   {% set current_sql %}
     SELECT COUNT(*) FROM (
-      SELECT {{ keys | join(', ') }} FROM {{ target_relation }}
-      GROUP BY {{ keys | join(', ') }} HAVING COALESCE(COUNT_IF(IS_CURRENT = TRUE), 0) <> 1
+      SELECT {{ keys | join(', ') }}
+      FROM {{ target_relation }} t
+      WHERE {{ target_affected_predicate }}
+      GROUP BY {{ keys | join(', ') }}
+      HAVING COALESCE(COUNT_IF(IS_CURRENT = TRUE), 0) <> 1
     ) bad
   {% endset %}
   {% set invalid_current = run_query(current_sql).rows[0][0] | int %}
@@ -238,7 +254,8 @@
     SELECT COUNT(*) FROM (
       SELECT {{ keys | join(', ') }}, VALID_FROM, VALID_TO, IS_CURRENT, VERSION_NO,
         LEAD(VALID_FROM) OVER (PARTITION BY {{ keys | join(', ') }} ORDER BY VERSION_NO) AS NEXT_FROM
-      FROM {{ target_relation }}
+      FROM {{ target_relation }} t
+      WHERE {{ target_affected_predicate }}
     ) h
     WHERE (IS_CURRENT = TRUE AND VALID_TO IS NOT NULL)
        OR (IS_CURRENT = FALSE AND VALID_TO IS NULL)
@@ -260,11 +277,15 @@
       {% endif %}
     {% endfor %}
     {% set source_match_sql %}
-      SELECT COUNT(*) FROM {{ source_relation }} s
+      SELECT COUNT(*)
+      FROM {{ source_relation }} s
       LEFT JOIN {{ target_relation }} t
         ON {{ join_on | join(' AND ') }} AND t.IS_CURRENT = TRUE
-      WHERE t.{{ keys[0] }} IS NULL
-      {% if nonkey | length > 0 %}OR {{ nonkey | join(' OR ') }}{% endif %}
+      WHERE {{ source_affected_predicate }}
+        AND (
+          t.{{ keys[0] }} IS NULL
+          {% if nonkey | length > 0 %}OR {{ nonkey | join(' OR ') }}{% endif %}
+        )
     {% endset %}
     {% set mismatches = run_query(source_match_sql).rows[0][0] | int %}
     {% set status = record_type2_post_check(model_execution_id, etl_nr,
@@ -287,7 +308,7 @@
 {% macro record_insert_skip(model_execution_id, etl_nr, check_name) %}
 
     {% set sql %}
-        INSERT INTO DBT_DEMO.ETL_CONTROL.ETL_DQ_RESULTS
+        INSERT INTO {{ enterprise_control_relation('ETL_DQ_RESULTS') }}
         (
             DQ_RESULT_ID, MODEL_EXECUTION_ID, ETL_NR,
             CHECK_NAME, CHECK_PHASE, CHECK_STATUS,
@@ -549,7 +570,7 @@
     {% set status = 'PASS' if observed == expected else 'FAIL' %}
 
     {% set sql %}
-        INSERT INTO DBT_DEMO.ETL_CONTROL.ETL_DQ_RESULTS
+        INSERT INTO {{ enterprise_control_relation('ETL_DQ_RESULTS') }}
         (
             DQ_RESULT_ID,
             MODEL_EXECUTION_ID,
@@ -594,7 +615,7 @@
 ) %}
 
     {% set sql %}
-        INSERT INTO DBT_DEMO.ETL_CONTROL.ETL_DQ_RESULTS
+        INSERT INTO {{ enterprise_control_relation('ETL_DQ_RESULTS') }}
         (
             DQ_RESULT_ID,
             MODEL_EXECUTION_ID,
@@ -890,7 +911,7 @@
     {% set status = 'PASS' if observed == expected else 'FAIL' %}
 
     {% set sql %}
-        INSERT INTO DBT_DEMO.ETL_CONTROL.ETL_DQ_RESULTS
+        INSERT INTO {{ enterprise_control_relation('ETL_DQ_RESULTS') }}
         (
             DQ_RESULT_ID, MODEL_EXECUTION_ID, ETL_NR,
             CHECK_NAME, CHECK_PHASE, CHECK_STATUS,
@@ -928,7 +949,7 @@
 ) %}
 
     {% set sql %}
-        INSERT INTO DBT_DEMO.ETL_CONTROL.ETL_DQ_RESULTS
+        INSERT INTO {{ enterprise_control_relation('ETL_DQ_RESULTS') }}
         (
             DQ_RESULT_ID, MODEL_EXECUTION_ID, ETL_NR,
             CHECK_NAME, CHECK_PHASE, CHECK_STATUS,
@@ -1188,7 +1209,7 @@
 
     {% set sql %}
 
-        INSERT INTO DBT_DEMO.ETL_CONTROL.ETL_DQ_RESULTS
+        INSERT INTO {{ enterprise_control_relation('ETL_DQ_RESULTS') }}
         (
             DQ_RESULT_ID,
             MODEL_EXECUTION_ID,
@@ -1265,18 +1286,24 @@
 
     {% endfor %}
 
+    {# Prepared source keys define the rows owned by this invocation.
+       Whole-table before/after counts are not stable under legitimate
+       concurrent DELETE_INSERT writers operating on disjoint keys. #}
+    {% set owned_key_match = generate_delete_insert_key_match(
+        natural_keys,
+        'tgt',
+        'src'
+    ) %}
 
-    {# 1. DML must affect exactly the expected keys and rows. #}
+
+    {# 1. DML statement counts must match this invocation's immutable
+       prepared source and pre-transaction overlap. Do not mix global
+       target_after into this execution-scoped invariant. #}
 
     {% set dml_ok = (
         dml_stats['rows_deleted'] == expected_deleted
         and dml_stats['rows_inserted'] == source_count
         and dml_stats['rows_updated'] == 0
-        and target_after == (
-            target_before
-            - dml_stats['rows_deleted']
-            + dml_stats['rows_inserted']
-        )
     ) %}
 
     {% set status = record_delete_insert_post_check(
@@ -1290,16 +1317,27 @@
     {% endif %}
 
 
-    {# 2. Reconcile final count with expected key-scoped replacement. #}
+    {# 2. Reconcile only the natural keys owned by this invocation.
+       A disjoint concurrent writer may legitimately change the whole-table
+       row count between this run's before/after observations. #}
 
-    {% set expected_after = (
-        target_before - expected_deleted + source_count
-    ) %}
+    {% set owned_count_sql %}
+        SELECT COUNT(*)
+        FROM {{ target_relation }} AS tgt
+        WHERE EXISTS (
+            SELECT 1
+            FROM {{ source_relation }} AS src
+            WHERE {{ owned_key_match }}
+        )
+    {% endset %}
+
+    {% set owned_target_count =
+        run_query(owned_count_sql).rows[0][0] | int %}
 
     {% set status = record_delete_insert_post_check(
         model_execution_id, etl_nr,
         'DELETE_INSERT_TARGET_ROW_COUNT',
-        target_after, expected_after,
+        owned_target_count, source_count,
         post_cfg['reconcile_counts']
     ) %}
 
@@ -1308,13 +1346,15 @@
     {% endif %}
 
 
-    {# 3. Target natural keys must not contain NULL. #}
+    {# 3. Natural keys written by this invocation must not contain NULL.
+       Whole-target key health was already validated pre-load. #}
 
     {% set null_sql %}
 
         SELECT COUNT(*)
         FROM {{ target_relation }} AS tgt
-        WHERE {{ null_conditions | join(' OR ') }}
+        WHERE ETL_CREATED_RUN_NUMBER = {{ etl_nr }}
+          AND ({{ null_conditions | join(' OR ') }})
 
     {% endset %}
 
@@ -1331,15 +1371,22 @@
     {% endif %}
 
 
-    {# 4. Target natural keys must remain unique. #}
+    {# 4. Natural keys owned by this invocation must remain unique.
+       Scope the check to the prepared source key set so unrelated writers
+       cannot make this completed run fail post-commit. #}
 
     {% set duplicate_sql %}
 
         SELECT COUNT(*)
         FROM (
-            SELECT {{ quoted_keys | join(', ') }}
-            FROM {{ target_relation }}
-            GROUP BY {{ quoted_keys | join(', ') }}
+            SELECT {% for q in quoted_keys %}tgt.{{ q }}{% if not loop.last %}, {% endif %}{% endfor %}
+            FROM {{ target_relation }} AS tgt
+            WHERE EXISTS (
+                SELECT 1
+                FROM {{ source_relation }} AS src
+                WHERE {{ owned_key_match }}
+            )
+            GROUP BY {% for q in quoted_keys %}tgt.{{ q }}{% if not loop.last %}, {% endif %}{% endfor %}
             HAVING COUNT(*) > 1
         ) d
 

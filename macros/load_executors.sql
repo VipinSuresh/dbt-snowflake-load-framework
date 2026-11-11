@@ -17,6 +17,9 @@
         etl_nr, model_id, target_relation_name, cfg['load_type']
     ) %}
 
+    {# Optional declared-window validation/audit; no SQL filtering is performed here. #}
+    {% do enforce_processing_window(cfg['processing_window'], model_execution_id, etl_nr) %}
+
     {# Validate the governed target. #}
     {% set target_relation = adapter.get_relation(
         database=target_relation_name.database,
@@ -217,6 +220,9 @@
 {% macro execute_enterprise_type2(cfg, model_id, model_name, target_relation_name, model_sql, pre_hooks_to_run, post_hooks_to_run) %}
   {% set etl_nr = get_current_etl_nr() %}
   {% set model_execution_id = start_model_stats(etl_nr, model_id, target_relation_name, 'TYPE2') %}
+
+    {# Optional declared-window validation/audit; no SQL filtering is performed here. #}
+    {% do enforce_processing_window(cfg['processing_window'], model_execution_id, etl_nr) %}
   {% set history_target = adapter.get_relation(
       database=target_relation_name.database,
       schema=target_relation_name.schema,
@@ -335,6 +341,24 @@
   {% set expected_insert = delta_info.rows[0][0] | int %}
   {% set expected_expire = delta_info.rows[0][1] | default(0, true) | int %}
 
+  {# Capture the pre-DML history size only for natural keys this invocation
+     will change. Whole-target before/after counts are concurrency-unsafe: a
+     legitimate writer on another key can change them while this run waits. #}
+  {% set affected_before_join = [] %}
+  {% for key in keys %}
+    {% do affected_before_join.append('t.' ~ key ~ ' = d.' ~ key) %}
+  {% endfor %}
+  {% set affected_before_sql %}
+    SELECT COUNT(*)
+    FROM {{ history_target }} t
+    WHERE EXISTS (
+      SELECT 1 FROM {{ delta_relation }} d
+      WHERE {{ affected_before_join | join(' AND ') }}
+    )
+  {% endset %}
+  {% set affected_before_result = run_query(affected_before_sql) %}
+  {% set affected_target_before = affected_before_result.rows[0][0] | int %}
+
   {# The first DML expires existing versions; the second creates new versions.
      Both are atomic in one Snowflake Scripting transaction and include ROLLBACK. #}
   {% set insert_fields = business_cols + [
@@ -349,12 +373,39 @@
       "'enterprise_dbt_framework'", ':v_ts', (etl_nr | string), ':v_ts',
       'NULL', 'NULL', 'NULL', 'NULL'
   ] %}
+  {# Only regression fixture may request an injected failure; never expose this
+     switch to general production model configurations. #}
+  {% set inject_critical_failure = (
+      model_name == 'regression_customer_type2'
+      and var('regression_type2_force_critical_failure', false) == true
+  ) %}
+  {# Regression-only concurrency delay. It runs after the TYPE2 UPDATE while
+     the transaction still owns its write lock, making a second dbt process
+     contend against the same governed target deterministically. #}
+  {% set concurrency_wait_seconds = 0 %}
+  {% if model_name == 'regression_customer_type2' %}
+    {% set concurrency_wait_seconds = var('regression_type2_concurrency_wait_seconds', 0) | int %}
+  {% endif %}
+  {% if concurrency_wait_seconds > 0 %}
+    {% do log('TYPE2 REGRESSION CONCURRENCY HOLD | seconds=' ~ concurrency_wait_seconds, info=true) %}
+  {% endif %}
+  {% set affected_key_join = [] %}
+  {% for key in keys %}
+    {% do affected_key_join.append('t.' ~ key ~ ' = d.' ~ key) %}
+  {% endfor %}
+  {% set affected_keys_predicate = 'EXISTS (SELECT 1 FROM ' ~ delta_relation
+      ~ ' d WHERE ' ~ (affected_key_join | join(' AND ')) ~ ')' %}
   {% do set_model_stage(model_execution_id, 'MERGE_RUNNING') %}
   {% call statement('main', fetch_result=True, auto_begin=False) %}
     EXECUTE IMMEDIATE $$
     DECLARE
       v_expired NUMBER DEFAULT 0;
       v_inserted NUMBER DEFAULT 0;
+      v_bad_current NUMBER DEFAULT 0;
+      v_bad_versions NUMBER DEFAULT 0;
+      v_bad_windows NUMBER DEFAULT 0;
+      v_failure_reason VARCHAR DEFAULT NULL;
+      type2_critical_dq_failed EXCEPTION (-20041, 'TYPE2_CRITICAL_DQ_FAILED: transaction rolled back');
       v_ts TIMESTAMP_NTZ DEFAULT CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ(9);
     BEGIN
       BEGIN TRANSACTION;
@@ -371,14 +422,110 @@
         AND t.IS_CURRENT = TRUE AND d.EL_ACTION = 'CHANGED';
       v_expired := SQLROWCOUNT;
 
+      {# REGRESSION_RUNTIME_FAILURE_TYPE2_BEGIN #}
+      {% if model_name == 'regression_customer_type2'
+            and var('regression_type2_force_runtime_failure', false) %}
+        LET regression_runtime_fault NUMBER :=
+          TO_NUMBER('RUNTIME_FAULT_SENTINEL_' || UUID_STRING());
+      {% endif %}
+      {# REGRESSION_RUNTIME_FAILURE_TYPE2_END #}
+
+      {# Deliberately hold the regression transaction after acquiring the
+         UPDATE lock. SYSTEM$WAIT is never enabled for non-regression models. #}
+      {% if concurrency_wait_seconds > 0 %}
+        CALL SYSTEM$WAIT({{ concurrency_wait_seconds }}, 'SECONDS');
+      {% endif %}
+
       INSERT INTO {{ history_target }} ({{ insert_fields | join(', ') }})
       SELECT {{ selected_fields | join(', ') }}
       FROM {{ delta_relation }} d;
       v_inserted := SQLROWCOUNT;
 
+      -- These are transaction invariants, not full-target post-load DQ.
+      -- DML counts must match the immutable delta prepared before BEGIN.
+      IF (v_inserted <> {{ expected_insert }} OR v_expired <> {{ expected_expire }}) THEN
+        v_failure_reason := 'DML_COUNT_MISMATCH';
+        RAISE type2_critical_dq_failed;
+      END IF;
+
+      -- The delta is prepared before BEGIN, so a concurrent run can commit the
+      -- same next VERSION_NO while this transaction is waiting on the target
+      -- write lock. Re-check version uniqueness for affected keys *inside* the
+      -- transaction before allowing COMMIT. This converts a stale-delta race
+      -- into a rollback instead of a post-commit DQ failure.
+      SELECT COUNT(*) INTO :v_bad_versions
+      FROM (
+        SELECT {{ keys | join(', ') }}, VERSION_NO
+        FROM {{ history_target }} t
+        WHERE {{ affected_keys_predicate }}
+        GROUP BY {{ keys | join(', ') }}, VERSION_NO
+        HAVING COUNT(*) > 1
+      ) invalid_versions;
+      IF (v_bad_versions <> 0) THEN
+        v_failure_reason := 'AFFECTED_KEY_DUPLICATE_VERSION';
+        RAISE type2_critical_dq_failed;
+      END IF;
+
+      -- Limit validation to natural keys impacted by this invocation.
+      SELECT COUNT(*) INTO :v_bad_current
+      FROM (
+        SELECT {{ keys | join(', ') }}
+        FROM {{ history_target }} t
+        WHERE {{ affected_keys_predicate }}
+        GROUP BY {{ keys | join(', ') }}
+        HAVING COALESCE(COUNT_IF(IS_CURRENT = TRUE), 0) <> 1
+      ) invalid_current;
+      IF (v_bad_current <> 0) THEN
+        v_failure_reason := 'AFFECTED_KEY_CURRENT_STATE';
+        RAISE type2_critical_dq_failed;
+      END IF;
+
+      SELECT COUNT(*) INTO :v_bad_windows
+      FROM (
+        SELECT {{ keys | join(', ') }}, VALID_FROM, VALID_TO, IS_CURRENT, VERSION_NO,
+          LEAD(VALID_FROM) OVER (
+            PARTITION BY {{ keys | join(', ') }} ORDER BY VERSION_NO
+          ) AS NEXT_FROM
+        FROM {{ history_target }} t
+        WHERE {{ affected_keys_predicate }}
+      ) history_rows
+      WHERE (IS_CURRENT = TRUE AND VALID_TO IS NOT NULL)
+         OR (IS_CURRENT = FALSE AND VALID_TO IS NULL)
+         OR (VALID_TO IS NOT NULL AND VALID_TO <= VALID_FROM)
+         OR (NEXT_FROM IS NOT NULL AND VALID_TO IS DISTINCT FROM NEXT_FROM);
+      IF (v_bad_windows <> 0) THEN
+        v_failure_reason := 'AFFECTED_KEY_HISTORY_WINDOWS';
+        RAISE type2_critical_dq_failed;
+      END IF;
+
+      {# Explicit failure injection proves *validation-triggered* rollback.
+         The flag only works for the isolated regression model. #}
+      {% if inject_critical_failure %}
+        v_failure_reason := 'REGRESSION_FORCED_FAILURE';
+        RAISE type2_critical_dq_failed;
+      {% endif %}
+
       COMMIT;
       RETURN TO_VARCHAR(v_expired) || '|' || TO_VARCHAR(v_inserted);
     EXCEPTION
+      WHEN type2_critical_dq_failed THEN
+        ROLLBACK;
+        -- Persist failure evidence in a separate transaction so the business
+        -- rollback cannot erase the audit record. Audit failure must not mask
+        -- the original load exception.
+        BEGIN
+          BEGIN TRANSACTION;
+          {{ transaction_dq_failure_audit_sql(
+              model_execution_id, etl_nr,
+              'TYPE2_TRANSACTION_CRITICAL_DQ', 'TYPE2'
+          ) }}
+          COMMIT;
+        EXCEPTION
+          WHEN OTHER THEN
+            ROLLBACK;
+            NULL;
+        END;
+        RAISE;
       WHEN OTHER THEN
         ROLLBACK;
         RAISE;
@@ -406,9 +553,26 @@
   {% set target_after = after_result.rows[0][0] | int %}
   {% do finish_model_stats(model_execution_id, dml, target_after) %}
 
-  {% set dq = run_type2_post_load_checks(prepared_source, history_target,
+  {# Reconcile this invocation's affected natural keys, not the entire target.
+     The delta temp table remains available until post-load checks finish. #}
+  {% set affected_after_join = [] %}
+  {% for key in keys %}
+    {% do affected_after_join.append('t.' ~ key ~ ' = d.' ~ key) %}
+  {% endfor %}
+  {% set affected_after_sql %}
+    SELECT COUNT(*)
+    FROM {{ history_target }} t
+    WHERE EXISTS (
+      SELECT 1 FROM {{ delta_relation }} d
+      WHERE {{ affected_after_join | join(' AND ') }}
+    )
+  {% endset %}
+  {% set affected_after_result = run_query(affected_after_sql) %}
+  {% set affected_target_after = affected_after_result.rows[0][0] | int %}
+
+  {% set dq = run_type2_post_load_checks(prepared_source, history_target, delta_relation,
       cfg['natural_keys'], model_execution_id, etl_nr,
-      target_before, target_after, dml, cfg['post_load']) %}
+      affected_target_before, affected_target_after, dml, cfg['post_load']) %}
   {# Cross-check that the transaction affected exactly the prepared delta. #}
   {% set count_ok = dml['rows_inserted'] == expected_insert and dml['rows_updated'] == expected_expire %}
   {% set count_status = record_type2_post_check(model_execution_id, etl_nr,
@@ -455,6 +619,9 @@
     {% set model_execution_id = start_model_stats(
         etl_nr, model_id, target_relation_name, 'INSERT'
     ) %}
+
+    {# Optional declared-window validation/audit; no SQL filtering is performed here. #}
+    {% do enforce_processing_window(cfg['processing_window'], model_execution_id, etl_nr) %}
 
     {# 2. Validate governed target existence. #}
 
@@ -692,6 +859,9 @@
     {% set model_execution_id = start_model_stats(
         etl_nr, model_id, target_relation_name, 'UPDATE'
     ) %}
+
+    {# Optional declared-window validation/audit; no SQL filtering is performed here. #}
+    {% do enforce_processing_window(cfg['processing_window'], model_execution_id, etl_nr) %}
 
     {# 2. Validate governed target existence. #}
 
@@ -933,6 +1103,9 @@
         etl_nr, model_id, target_relation_name, 'TRUNCATE_LOAD'
     ) %}
 
+    {# Optional declared-window validation/audit; no SQL filtering is performed here. #}
+    {% do enforce_processing_window(cfg['processing_window'], model_execution_id, etl_nr) %}
+
 
     {# 2. Require an existing governed physical table. #}
 
@@ -1028,15 +1201,44 @@
     {% endif %}
 
 
-    {# 6. Capture current target count and optionally guard major drops. #}
+    {# 6. Capture current target state and optionally guard major drops.
+       Row count alone is not a sufficient concurrency token for full-table
+       replacement, because a concurrent writer can leave the same row count
+       with different contents. Capture an order-independent content fingerprint
+       over the validated business columns plus the creation-run audit token.
+    #}
 
     {% if pre_results['passed'] %}
 
-        {% set before_result = run_query(
-            'SELECT COUNT(*) FROM ' ~ target_relation
+        {% set replace_source_columns =
+            adapter.get_columns_in_relation(source_relation) %}
+
+        {% set replace_fingerprint_exprs = [] %}
+
+        {% for col in replace_source_columns %}
+            {% do replace_fingerprint_exprs.append(
+                'TO_VARCHAR(' ~ adapter.quote(col.name) ~ ')'
+            ) %}
+        {% endfor %}
+
+        {% do replace_fingerprint_exprs.append(
+            'TO_VARCHAR(' ~ adapter.quote('ETL_CREATED_RUN_NUMBER') ~ ')'
         ) %}
 
+        {% set replace_fingerprint_sql =
+            'HASH_AGG(' ~ (replace_fingerprint_exprs | join(', ')) ~ ')' %}
+
+        {% set before_sql %}
+            SELECT
+                COUNT(*) AS ROW_COUNT,
+                {{ replace_fingerprint_sql }} AS CONTENT_FINGERPRINT
+            FROM {{ target_relation }}
+        {% endset %}
+
+        {% set before_result = run_query(before_sql) %}
+
         {% set target_before = before_result.rows[0][0] | int %}
+        {% set target_fingerprint_before = before_result.rows[0][1] | int %}
 
         {% if volume_cfg.get('enabled', false)
             and target_before > 0 %}
@@ -1074,6 +1276,82 @@
     {% endif %}
 
 
+    {# 6b. Require the framework-level TRUNCATE_LOAD serialization token.
+       Full-table replacement cannot depend on a row in the governed target for
+       locking because the target may legitimately be empty. The control row is
+       provisioned by setup/create_etl_control_objects.sql and is shared by all
+       TRUNCATE_LOAD executions. A monotonically increasing LOCK_VERSION is also
+       captured as an optimistic concurrency token.
+    #}
+
+    {% set truncate_lock_relation =
+        enterprise_control_relation('ETL_FRAMEWORK_LOCKS') %}
+
+    {% set truncate_lock_version_before = 0 %}
+
+    {% if pre_results['passed'] %}
+
+        {% set truncate_lock_actual = adapter.get_relation(
+            database=truncate_lock_relation.database,
+            schema=truncate_lock_relation.schema,
+            identifier=truncate_lock_relation.identifier
+        ) %}
+
+        {% if truncate_lock_actual is none
+            or truncate_lock_actual.type | lower != 'table' %}
+
+            {% do record_pre_load_check(
+                model_execution_id, etl_nr,
+                'TRUNCATE_LOAD_SERIALIZATION_LOCK',
+                false, 0, 1,
+                'ETL_FRAMEWORK_LOCKS must exist before TRUNCATE_LOAD can run'
+            ) %}
+
+            {% do pre_results['failed_checks'].append(
+                'TRUNCATE_LOAD_SERIALIZATION_LOCK'
+            ) %}
+            {% do pre_results.update({'passed': false}) %}
+
+        {% else %}
+
+            {% set truncate_lock_state_sql %}
+                SELECT
+                    COUNT(*) AS LOCK_ROWS,
+                    COALESCE(MAX(LOCK_VERSION), -1) AS LOCK_VERSION
+                FROM {{ truncate_lock_relation }}
+                WHERE LOCK_NAME = 'TRUNCATE_LOAD_GLOBAL'
+            {% endset %}
+
+            {% set truncate_lock_state = run_query(truncate_lock_state_sql) %}
+            {% set truncate_lock_rows =
+                truncate_lock_state.rows[0][0] | int %}
+
+            {% set truncate_lock_ok = truncate_lock_rows == 1 %}
+
+            {% do record_pre_load_check(
+                model_execution_id, etl_nr,
+                'TRUNCATE_LOAD_SERIALIZATION_LOCK',
+                truncate_lock_ok,
+                truncate_lock_rows,
+                1,
+                'Exactly one TRUNCATE_LOAD_GLOBAL control row is required'
+            ) %}
+
+            {% if truncate_lock_ok %}
+                {% set truncate_lock_version_before =
+                    truncate_lock_state.rows[0][1] | int %}
+            {% else %}
+                {% do pre_results['failed_checks'].append(
+                    'TRUNCATE_LOAD_SERIALIZATION_LOCK'
+                ) %}
+                {% do pre_results.update({'passed': false}) %}
+            {% endif %}
+
+        {% endif %}
+
+    {% endif %}
+
+
     {# 7. Reject the replacement if any pre-load check failed. #}
 
     {% if not pre_results['passed'] %}
@@ -1099,6 +1377,8 @@
         target_before
     ) %}
 
+    {# TRUNCATE_LOAD serialization is provided by ETL_FRAMEWORK_LOCKS. #}
+
 
     {# 8. Generate INSERT SQL from prepared source. #}
 
@@ -1111,8 +1391,32 @@
 
 
     {# 9. Execute DELETE and INSERT atomically.
-       SQLROWCOUNT must be captured immediately after each DML.
+       SQLROWCOUNT is captured immediately after each DML and validated before
+       COMMIT. Broader replacement DQ remains post-commit.
     #}
+
+    {% set inject_critical_failure = (
+        model_name == 'regression_customer_replace'
+        and var('regression_truncate_force_critical_failure', false) == true
+    ) %}
+
+    {# Regression-only concurrency delay. Hold the transaction after the
+       framework control lock is acquired so a second full replacement must
+       wait before target revalidation and destructive work. #}
+    {% set truncate_concurrency_wait_seconds = 0 %}
+    {% if model_name == 'regression_customer_replace' %}
+        {% set truncate_concurrency_wait_seconds = var(
+            'regression_truncate_concurrency_wait_seconds', 0
+        ) | int %}
+    {% endif %}
+
+    {% if truncate_concurrency_wait_seconds > 0 %}
+        {% do log(
+            'TRUNCATE_LOAD REGRESSION CONCURRENCY HOLD | seconds='
+            ~ truncate_concurrency_wait_seconds,
+            info=true
+        ) %}
+    {% endif %}
 
     {% do set_model_stage(
         model_execution_id, 'MERGE_RUNNING'
@@ -1124,17 +1428,115 @@
         DECLARE
             v_deleted NUMBER DEFAULT 0;
             v_inserted NUMBER DEFAULT 0;
+            v_lock_rows NUMBER DEFAULT 0;
+            v_lock_version NUMBER DEFAULT 0;
+            v_current_count NUMBER DEFAULT 0;
+            v_current_fingerprint NUMBER(19,0) DEFAULT 0;
+            v_failure_reason VARCHAR DEFAULT NULL;
+            truncate_critical_dq_failed EXCEPTION
+                (-20043, 'TRUNCATE_LOAD_CRITICAL_DQ_FAILED: transaction rolled back');
         BEGIN
 
             BEGIN TRANSACTION;
+
+            -- Serialize every TRUNCATE_LOAD through a framework-owned control
+            -- row. Unlike the governed target, this row exists even when the
+            -- target is empty. Updating LOCK_VERSION is a real DML mutation, so
+            -- concurrent framework replacements contend on the same resource.
+            UPDATE {{ truncate_lock_relation }}
+            SET
+                LOCK_VERSION = LOCK_VERSION + 1,
+                LAST_ETL_NR = {{ etl_nr }},
+                LAST_MODEL_EXECUTION_ID = '{{ model_execution_id }}',
+                LAST_ACQUIRED_AT = CURRENT_TIMESTAMP()
+            WHERE LOCK_NAME = 'TRUNCATE_LOAD_GLOBAL';
+
+            v_lock_rows := SQLROWCOUNT;
+
+            IF (v_lock_rows <> 1) THEN
+                v_failure_reason := 'SERIALIZATION_LOCK_UNAVAILABLE';
+                RAISE truncate_critical_dq_failed;
+            END IF;
+
+            SELECT LOCK_VERSION
+            INTO :v_lock_version
+            FROM {{ truncate_lock_relation }}
+            WHERE LOCK_NAME = 'TRUNCATE_LOAD_GLOBAL';
+
+            -- Both contenders can capture the same pre-load LOCK_VERSION. The
+            -- winner increments it and commits. The waiter then increments from
+            -- the winner's value; if that is not exactly our captured version+1,
+            -- another replacement completed after our pre-load snapshot.
+            IF (v_lock_version <> {{ (truncate_lock_version_before | int) + 1 }}) THEN
+                v_failure_reason := 'TARGET_CHANGED_SINCE_PRECHECK';
+                RAISE truncate_critical_dq_failed;
+            END IF;
+
+            {# Regression-only hold after the serialization lock is owned. #}
+            {% if truncate_concurrency_wait_seconds > 0 %}
+                CALL SYSTEM$WAIT({{ truncate_concurrency_wait_seconds }}, 'SECONDS');
+            {% endif %}
+
+            -- Re-read target state only after the framework serialization lock
+            -- is owned. This catches out-of-band target changes as well as any
+            -- stale framework writer and fails before DELETE.
+            SELECT
+                COUNT(*),
+                {{ replace_fingerprint_sql }}
+            INTO
+                :v_current_count,
+                :v_current_fingerprint
+            FROM {{ target_relation }};
+
+            IF (v_current_count <> {{ target_before }}
+                OR v_current_fingerprint <> {{ target_fingerprint_before }}) THEN
+                v_failure_reason := 'TARGET_CHANGED_SINCE_PRECHECK';
+                RAISE truncate_critical_dq_failed;
+            END IF;
+
+            {# Regression-only hold after stale-target recheck. This is used by
+               the empty-baseline concurrency test to force two sessions to
+               both observe the empty target before either reaches DELETE. #}
+            {% if model_name == 'regression_customer_replace' %}
+                {% set truncate_post_recheck_wait_seconds = var(
+                    'regression_truncate_post_recheck_wait_seconds', 0
+                ) | int %}
+            {% else %}
+                {% set truncate_post_recheck_wait_seconds = 0 %}
+            {% endif %}
+            {% if truncate_post_recheck_wait_seconds > 0 %}
+                CALL SYSTEM$WAIT({{ truncate_post_recheck_wait_seconds }}, 'SECONDS');
+            {% endif %}
 
             DELETE FROM {{ target_relation }};
 
             v_deleted := SQLROWCOUNT;
 
+            {# REGRESSION_RUNTIME_FAILURE_TRUNCATE_BEGIN #}
+            {% if model_name == 'regression_customer_replace'
+                  and var('regression_truncate_force_runtime_failure', false) %}
+                LET regression_runtime_fault NUMBER :=
+                    TO_NUMBER('RUNTIME_FAULT_SENTINEL_' || UUID_STRING());
+            {% endif %}
+            {# REGRESSION_RUNTIME_FAILURE_TRUNCATE_END #}
+
             {{ insert_sql }};
 
             v_inserted := SQLROWCOUNT;
+
+            -- Commit gate: the winning replacement must remove the complete
+            -- locked target and insert the complete immutable prepared source.
+            IF (v_deleted <> {{ target_before }}
+                OR v_inserted <> {{ pre_results['source_row_count'] | int }}) THEN
+                v_failure_reason := 'DML_COUNT_MISMATCH';
+                RAISE truncate_critical_dq_failed;
+            END IF;
+
+            {# Regression-only failure injection proves validation-triggered rollback. #}
+            {% if inject_critical_failure %}
+                v_failure_reason := 'REGRESSION_FORCED_FAILURE';
+                RAISE truncate_critical_dq_failed;
+            {% endif %}
 
             COMMIT;
 
@@ -1142,6 +1544,22 @@
                 || '|' || TO_VARCHAR(v_inserted);
 
         EXCEPTION
+            WHEN truncate_critical_dq_failed THEN
+                ROLLBACK;
+                BEGIN
+                    BEGIN TRANSACTION;
+                    {{ transaction_dq_failure_audit_sql(
+                        model_execution_id, etl_nr,
+                        'TRUNCATE_LOAD_TRANSACTION_CRITICAL_DQ',
+                        'TRUNCATE_LOAD'
+                    ) }}
+                    COMMIT;
+                EXCEPTION
+                    WHEN OTHER THEN
+                        ROLLBACK;
+                        NULL;
+                END;
+                RAISE;
             WHEN OTHER THEN
                 ROLLBACK;
                 RAISE;
@@ -1273,6 +1691,9 @@
     {% set model_execution_id = start_model_stats(
         etl_nr, model_id, target_relation_name, 'DELETE_INSERT'
     ) %}
+
+    {# Optional declared-window validation/audit; no SQL filtering is performed here. #}
+    {% do enforce_processing_window(cfg['processing_window'], model_execution_id, etl_nr) %}
 
 
     {# 2. Resolve existing governed target. #}
@@ -1445,7 +1866,32 @@
     ) %}
 
 
-    {# 9. Execute DELETE and INSERT in one transaction. #}
+    {# 9. Execute DELETE and INSERT in one transaction.
+       The DML-count invariant is enforced before COMMIT; broader DQ remains
+       post-commit so expensive scans do not extend the critical section. #}
+
+    {% set inject_critical_failure = (
+        model_name == 'regression_customer_delete_insert'
+        and var('regression_delete_insert_force_critical_failure', false) == true
+    ) %}
+
+    {# Regression-only concurrency delay. Hold the transaction after DELETE
+       has acquired the target write lock so a second independent dbt process
+       evaluates its stale pre-transaction overlap count under contention. #}
+    {% set concurrency_wait_seconds = 0 %}
+    {% if model_name == 'regression_customer_delete_insert' %}
+        {% set concurrency_wait_seconds = var(
+            'regression_delete_insert_concurrency_wait_seconds', 0
+        ) | int %}
+    {% endif %}
+
+    {% if concurrency_wait_seconds > 0 %}
+        {% do log(
+            'DELETE_INSERT REGRESSION CONCURRENCY HOLD | seconds='
+            ~ concurrency_wait_seconds,
+            info=true
+        ) %}
+    {% endif %}
 
     {% do set_model_stage(
         model_execution_id, 'MERGE_RUNNING'
@@ -1457,6 +1903,9 @@
         DECLARE
             v_deleted NUMBER DEFAULT 0;
             v_inserted NUMBER DEFAULT 0;
+            v_failure_reason VARCHAR DEFAULT NULL;
+            delete_insert_critical_dq_failed EXCEPTION
+                (-20042, 'DELETE_INSERT_CRITICAL_DQ_FAILED: transaction rolled back');
         BEGIN
 
             BEGIN TRANSACTION;
@@ -1465,9 +1914,36 @@
 
             v_deleted := SQLROWCOUNT;
 
+            {# REGRESSION_RUNTIME_FAILURE_DELETE_INSERT_BEGIN #}
+            {% if model_name == 'regression_customer_delete_insert'
+                  and var('regression_delete_insert_force_runtime_failure', false) %}
+                LET regression_runtime_fault NUMBER :=
+                    TO_NUMBER('RUNTIME_FAULT_SENTINEL_' || UUID_STRING());
+            {% endif %}
+            {# REGRESSION_RUNTIME_FAILURE_DELETE_INSERT_END #}
+
+            {# Regression-only hold after DELETE has taken the target write lock. #}
+            {% if concurrency_wait_seconds > 0 %}
+                CALL SYSTEM$WAIT({{ concurrency_wait_seconds }}, 'SECONDS');
+            {% endif %}
+
             {{ insert_sql }};
 
             v_inserted := SQLROWCOUNT;
+
+            -- Commit gate: the immutable prepared source and pre-DML overlap
+            -- define exactly how many rows this transaction may affect.
+            IF (v_deleted <> {{ expected_deleted }}
+                OR v_inserted <> {{ pre_results['source_row_count'] | int }}) THEN
+                v_failure_reason := 'DML_COUNT_MISMATCH';
+                RAISE delete_insert_critical_dq_failed;
+            END IF;
+
+            {# Regression-only failure injection proves validation-triggered rollback. #}
+            {% if inject_critical_failure %}
+                v_failure_reason := 'REGRESSION_FORCED_FAILURE';
+                RAISE delete_insert_critical_dq_failed;
+            {% endif %}
 
             COMMIT;
 
@@ -1475,6 +1951,22 @@
                 || '|' || TO_VARCHAR(v_inserted);
 
         EXCEPTION
+            WHEN delete_insert_critical_dq_failed THEN
+                ROLLBACK;
+                BEGIN
+                    BEGIN TRANSACTION;
+                    {{ transaction_dq_failure_audit_sql(
+                        model_execution_id, etl_nr,
+                        'DELETE_INSERT_TRANSACTION_CRITICAL_DQ',
+                        'DELETE_INSERT'
+                    ) }}
+                    COMMIT;
+                EXCEPTION
+                    WHEN OTHER THEN
+                        ROLLBACK;
+                        NULL;
+                END;
+                RAISE;
             WHEN OTHER THEN
                 ROLLBACK;
                 RAISE;
