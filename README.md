@@ -17,6 +17,7 @@ The project is not primarily about writing six SQL loading patterns. It demonstr
 
 This framework is most relevant to governed data platforms that need consistent loading, validation, audit, and failure-handling behavior across existing Snowflake targets. Its value comes from repeated operational and governance requirements across workloads, not from the size of the development team. It is not intended to replace native dbt materializations where those already satisfy the operational requirements.
 
+**Related article:** [Where Load Frameworks Break: Transactions, Concurrency, and Rollback in dbt + Snowflake](https://medium.com/@vs.vipinsuresh/where-load-frameworks-break-transactions-concurrency-and-rollback-in-dbt-snowflake-07a6778df079)
 ---
 
 ## What This Project Demonstrates
