@@ -15,6 +15,8 @@ The project is not primarily about writing six SQL loading patterns. It demonstr
 
 > **Scope:** This repository is an enterprise-style reference implementation, not a drop-in production package for every Snowflake environment.
 
+This framework is most relevant to governed data platforms that need consistent loading, validation, audit, and failure-handling behavior across existing Snowflake targets. Its value comes from repeated operational and governance requirements across workloads, not from the size of the development team. It is not intended to replace native dbt materializations where those already satisfy the operational requirements.
+
 ---
 
 ## What This Project Demonstrates
@@ -340,7 +342,7 @@ TRUNCATE_LOAD_GLOBAL
 
 Competing full-replacement executions serialize on this control state before the governed target is modified.
 
-The current implementation intentionally uses a coarse global lock in favor of correctness and simplicity.
+Full-replacement loads are serialized through a framework-owned global lock. This is a deliberate correctness-first choice. More granular per-target serialization would require a different coordination design and additional implementation choices, so it was intentionally left outside this reference implementation.
 
 ---
 
@@ -665,10 +667,24 @@ Current boundaries include:
 - no dedicated concurrency regression for `TYPE1`, `INSERT`, or `UPDATE`
 - no dedicated regression specifically for empty-source behavior
 - no exhaustive late-arriving TYPE2 scenario suite
-- `TRUNCATE_LOAD` currently uses coarse global serialization
+- `TRUNCATE_LOAD` currently uses global serialization; more granular per-target serialization would require a different coordination design and additional implementation choices
 - deployment, permissions, monitoring, alerting, and operational controls must be adapted to the target organization
 
 These are explicit boundaries of the current reference implementation rather than claims of behavior that has not been tested.
+
+---
+
+## When Not to Use This
+
+This framework is not the best fit for every dbt project.
+
+It may be unnecessary when:
+
+- native dbt incremental models or snapshots already satisfy the loading and governance requirements
+- the project is greenfield and dbt fully owns target-table lifecycle and DDL
+- the workload requires very low-latency, high-frequency processing where per-run validation and audit overhead would be inappropriate
+- large-scale performance is a primary requirement and the framework has not yet been benchmarked at that scale
+- the team prefers minimal custom materialization logic and lower framework-maintenance overhead
 
 ---
 
