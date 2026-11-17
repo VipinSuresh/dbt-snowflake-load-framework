@@ -2,6 +2,20 @@
 
 A configuration-driven **dbt + Snowflake reference implementation** for loading existing, governed target tables with six reusable load strategies, schema contracts, execution auditing, transactional commit gates, rollback-safe failure handling, and regression-tested concurrency behavior.
 
+## Highlights
+
+- **Six load strategies, one materialization.** A custom `enterprise_load` materialization routes TYPE1, TYPE2 (SCD2), INSERT, UPDATE, DELETE_INSERT, and TRUNCATE_LOAD through a common lifecycle of pre-load validation, load execution, post-load reconciliation, and audit tracking.
+
+- **Transactional protection for multi-step loads.** TYPE2, DELETE_INSERT, and TRUNCATE_LOAD execute their dependent DML and transaction-critical checks within explicit Snowflake transactions so they commit or roll back together. Temporary execution objects are prepared outside the business transaction.
+
+- **Stale executions are detected before destructive work is committed.** Concurrency-sensitive strategies validate execution-owned or target state before commit. For TRUNCATE_LOAD, the framework serializes full replacements through a global control row and then rechecks the specific target using its pre-load row count and content fingerprint.
+
+- **Failures leave evidence.** Controlled transaction-critical failures roll back the business DML while failure information is persisted separately in the framework audit tables.
+
+- **Concurrency is tested, not assumed.** Targeted regression scripts force overlapping executions for TYPE2, DELETE_INSERT, and TRUNCATE_LOAD, covering same-key or overlapping-key writers, distinct-key writers, populated and empty replacement targets, and concurrent replacement of distinct physical targets.
+
+- **Concurrency behavior has been refined through review and regression testing.** A review identified that the shared TRUNCATE_LOAD lock version could incorrectly couple replacements of different physical targets. The implementation now separates global serialization from per-target stale detection, with a dedicated regression verifying that different-target replacements can both succeed while same-target stale writers are still rejected.
+
 The project is not primarily about writing six SQL loading patterns. It demonstrates the engineering problems that appear when those patterns are placed behind a common enterprise-style loading interface:
 
 - defining safe transaction boundaries
