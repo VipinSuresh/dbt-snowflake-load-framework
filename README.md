@@ -496,8 +496,11 @@ Testing covers:
 - concurrent same-count replacement
 - empty-target replacement
 - stale-target detection
+- concurrent replacement of distinct physical targets
 
 The framework serialization lock prevents two full-replacement writers from independently treating the same baseline as valid.
+
+The lock row is a global mutual-exclusion mechanism. `LOCK_VERSION` records lock acquisition activity but is not used to determine whether a governed target became stale, because replacements of unrelated targets also advance the same global version. After acquiring the lock, each execution rechecks its own target using the pre-load row count and content fingerprint. Same-target stale writers are rejected, while serialized replacements of different targets are allowed to proceed.
 
 Concurrency behavior for single-statement `TYPE1`, `INSERT`, and `UPDATE` has not been separately regression-tested in this project.
 
@@ -522,7 +525,8 @@ Coverage includes:
 - TYPE2 distinct-key concurrency
 - DELETE_INSERT overlapping-key concurrency
 - DELETE_INSERT distinct-key concurrency
-- TRUNCATE_LOAD concurrency
+- TRUNCATE_LOAD same-target concurrency
+- TRUNCATE_LOAD distinct-target concurrency
 - empty-target full-replacement serialization
 - composite natural keys
 - NULL composite-key components
@@ -555,6 +559,7 @@ run_concurrency_delete_insert.py
 run_concurrency_delete_insert_distinct_keys.py
 run_concurrency_truncate_load.py
 run_concurrency_truncate_load_empty.py
+run_concurrency_truncate_load_distinct_targets.py
 run_edge_composite_keys.py
 run_edge_schema_drift.py
 run_edge_target_corruption.py

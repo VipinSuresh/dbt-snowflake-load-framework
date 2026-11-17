@@ -1276,18 +1276,18 @@
     {% endif %}
 
 
-    {# 6b. Require the framework-level TRUNCATE_LOAD serialization token.
-       Full-table replacement cannot depend on a row in the governed target for
-       locking because the target may legitimately be empty. The control row is
-       provisioned by setup/create_etl_control_objects.sql and is shared by all
-       TRUNCATE_LOAD executions. A monotonically increasing LOCK_VERSION is also
-       captured as an optimistic concurrency token.
+    {# 6b. Full-table replacement cannot depend on a row in the governed target for
+        locking because the target may legitimately be empty. The control row is
+        provisioned by setup/create_etl_control_objects.sql and is shared by all
+        TRUNCATE_LOAD executions. The row is only a mutual-exclusion token:
+        LOCK_VERSION is not used for stale-target detection, because it is
+        global and is bumped by replacements of other targets too. Stale-target
+        detection is done per target by the count + content fingerprint re-check
+        inside the transaction.
     #}
 
     {% set truncate_lock_relation =
         enterprise_control_relation('ETL_FRAMEWORK_LOCKS') %}
-
-    {% set truncate_lock_version_before = 0 %}
 
     {% if pre_results['passed'] %}
 
@@ -1316,8 +1316,7 @@
 
             {% set truncate_lock_state_sql %}
                 SELECT
-                    COUNT(*) AS LOCK_ROWS,
-                    COALESCE(MAX(LOCK_VERSION), -1) AS LOCK_VERSION
+                    COUNT(*) AS LOCK_ROWS
                 FROM {{ truncate_lock_relation }}
                 WHERE LOCK_NAME = 'TRUNCATE_LOAD_GLOBAL'
             {% endset %}
@@ -1337,10 +1336,7 @@
                 'Exactly one TRUNCATE_LOAD_GLOBAL control row is required'
             ) %}
 
-            {% if truncate_lock_ok %}
-                {% set truncate_lock_version_before =
-                    truncate_lock_state.rows[0][1] | int %}
-            {% else %}
+            {% if not truncate_lock_ok %}
                 {% do pre_results['failed_checks'].append(
                     'TRUNCATE_LOAD_SERIALIZATION_LOCK'
                 ) %}
@@ -1429,7 +1425,6 @@
             v_deleted NUMBER DEFAULT 0;
             v_inserted NUMBER DEFAULT 0;
             v_lock_rows NUMBER DEFAULT 0;
-            v_lock_version NUMBER DEFAULT 0;
             v_current_count NUMBER DEFAULT 0;
             v_current_fingerprint NUMBER(19,0) DEFAULT 0;
             v_failure_reason VARCHAR DEFAULT NULL;
@@ -1458,19 +1453,10 @@
                 RAISE truncate_critical_dq_failed;
             END IF;
 
-            SELECT LOCK_VERSION
-            INTO :v_lock_version
-            FROM {{ truncate_lock_relation }}
-            WHERE LOCK_NAME = 'TRUNCATE_LOAD_GLOBAL';
-
-            -- Both contenders can capture the same pre-load LOCK_VERSION. The
-            -- winner increments it and commits. The waiter then increments from
-            -- the winner's value; if that is not exactly our captured version+1,
-            -- another replacement completed after our pre-load snapshot.
-            IF (v_lock_version <> {{ (truncate_lock_version_before | int) + 1 }}) THEN
-                v_failure_reason := 'TARGET_CHANGED_SINCE_PRECHECK';
-                RAISE truncate_critical_dq_failed;
-            END IF;
+            -- The lock row is global, so LOCK_VERSION also moves when another
+            -- target is replaced. Do not compare it to a pre-load snapshot;
+            -- the per-target count + fingerprint re-check below is the
+            -- stale-target guard.
 
             {# Regression-only hold after the serialization lock is owned. #}
             {% if truncate_concurrency_wait_seconds > 0 %}

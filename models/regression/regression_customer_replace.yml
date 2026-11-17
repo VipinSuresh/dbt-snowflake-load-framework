@@ -6,7 +6,7 @@ models:
       materialized: enterprise_load
       database: "{{ var('enterprise_regression_database', target.database) }}"
       schema: "{{ var('enterprise_regression_schema', 'REGRESSION_TEST') }}"
-      alias: DIM_CUSTOMER_REPLACE_TEST
+      alias: "{{ var('regression_replace_target_alias', 'DIM_CUSTOMER_REPLACE_TEST') }}"
 
       meta:
         enterprise_load:
